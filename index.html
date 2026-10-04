@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linux 7.2.8 — boot</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="screen-wrap">
+    <canvas id="screen" width="640" height="400"></canvas>
+    <div id="scanlines" aria-hidden="true"></div>
+  </div>
+
+  <!-- Classic scripts (not modules) so this page also opens straight from
+       file://. Load order matters: data, then code, then the driver. -->
+  <script src="src/font.data.js"></script>
+  <script src="src/font.js"></script>
+  <script src="src/renderer.js"></script>
+  <script src="src/vt.js"></script>
+  <script src="src/bootlog.data.js"></script>
+  <script src="src/bash.data.js"></script>
+  <script src="src/help.js"></script>
+  <script src="src/sha256.js"></script>
+  <script src="src/vfs.js"></script>
+  <script src="src/devtmpfs.js"></script>
+  <script src="src/apt.js"></script>
+  <script src="src/bash.js"></script>
+  <script src="src/getty.js"></script>
+  <script src="src/vts.js"></script>
+  <script src="src/main.js"></script>
+</body>
+</html>

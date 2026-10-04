@@ -1,0 +1,27 @@
+\e[0;1;39mWelcome to Debian GNU/Linux 13 (trixie)!\e[0m
+
+\e[0;1;32m[  OK  ]\e[0m Created slice system-getty.slice - Slice /system/getty.
+\e[0;1;32m[  OK  ]\e[0m Created slice system-modprobe.slice - Slice /system/modprobe.
+\e[0;1;32m[  OK  ]\e[0m Created slice user.slice - User and Session Slice.
+\e[0;1;32m[  OK  ]\e[0m Started systemd-journald.service - Journal Service.
+\e[0;1;32m[  OK  ]\e[0m Started systemd-udevd.service - Rule-based Manager for Device Events and Files.
+\e[0;1;32m[  OK  ]\e[0m Listening on systemd-udevd-control.socket - udev Control Socket.
+\e[0;1;32m[  OK  ]\e[0m Listening on systemd-udevd-kernel.socket - udev Kernel Socket.
+\e[0;1;32m[  OK  ]\e[0m Reached target paths.target - Path Units.
+\e[0;1;32m[  OK  ]\e[0m Started systemd-remount-fs.service - Remount Root and Kernel File Systems.
+\e[0;1;32m[  OK  ]\e[0m Started systemd-random-seed.service - Load/Save OS Random Seed.
+\e[0;1;32m[  OK  ]\e[0m Started systemd-tmpfiles-setup-dev.service - Create Static Device Nodes in /dev.
+\e[0;1;32m[  OK  ]\e[0m Mounted boot.mount - /boot.
+\e[0;1;32m[  OK  ]\e[0m Reached target local-fs-pre.target - Preparation for Local File Systems.
+\e[0;1;32m[  OK  ]\e[0m Reached target local-fs.target - Local File Systems.
+\e[0;1;32m[  OK  ]\e[0m Reached target sysinit.target - System Initialization.
+\e[0;1;32m[  OK  ]\e[0m Reached target sockets.target - Socket Units.
+\e[0;1;32m[  OK  ]\e[0m Started dbus.service - D-Bus System Message Bus.
+\e[0;1;32m[  OK  ]\e[0m Started cron.service - Regular background program processing daemon.
+\e[0;1;32m[  OK  ]\e[0m Started ssh.service - OpenBSD Secure Shell server.
+\e[0;1;32m[  OK  ]\e[0m Started systemd-logind.service - User Login Management.
+\e[0;1;32m[  OK  ]\e[0m Reached target basic.target - Basic System.
+\e[0;1;32m[  OK  ]\e[0m Started getty@tty1.service - Getty on tty1.
+\e[0;1;32m[  OK  ]\e[0m Reached target multi-user.target - Multi-User System.
+\e[0;1;32m[  OK  ]\e[0m Reached target graphical.target - Graphical Interface.
+

@@ -1,0 +1,7 @@
+# Extracted kernel/bash sources — regenerated on demand by tools/*.py
+tools/.cache/
+
+# Editor / OS noise
+*~
+*.swp
+.DS_Store

@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Assemble the boot / kernel log displayed by linuxweb.
+
+Every line is anchored to a real printk/pr_* format string in the Linux 7.2.8
+source: tools/registry.json names, for each ordered line, the source `file`, a
+`match` substring that MUST appear in that file, and the rendered `text`.
+
+Important: the timestamps are NOT baked in.  A real klog timestamp depends on
+how long the machine actually took, so this tool only emits, per line, a
+planned *delay* (`d`, seconds).  The browser measures real elapsed time while
+replaying the log and stamps each line with that measured value at runtime.
+
+Outputs
+  data/bootlog.txt      messages, one per line, no timestamps (canonical)
+  src/bootlog.data.js   window.LW.KLOG = [{t, d, raw}, ...]
+
+It fails loudly if any anchor is missing, so the log can never silently drift
+away from the 7.2.8 tree.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+DEFAULT_TARBALL = "/home/Yin/Downloads/linux-7.2.8.tar.xz"
+KERNEL_PREFIX = "linux-7.2.8/"
+
+
+def root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_registry(path: str) -> dict:
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def ensure_sources(files, tarball: str) -> None:
+    cache = os.path.join(root(), "tools", ".cache", "src")
+    os.makedirs(cache, exist_ok=True)
+    missing = [f for f in files if not os.path.exists(os.path.join(cache, f))]
+    if not missing:
+        return
+    if not os.path.exists(tarball):
+        raise SystemExit(
+            "these kernel sources are not cached and no tarball is available:\n"
+            + "\n".join("  " + f for f in missing)
+            + f"\n(give a linux-7.2.8 tarball as the second argument; looked at {tarball})"
+        )
+    print(f"extracting {len(missing)} kernel source file(s) from tarball")
+    members = [KERNEL_PREFIX + f for f in missing]
+    subprocess.check_call(["tar", "-xJf", tarball, "-C", cache, "--strip-components=1"] + members)
+
+
+def _jitter(i: int) -> float:
+    """Deterministic 0.70..1.30 jitter so output is reproducible."""
+    return 0.70 + 0.60 * (((i * 2654435761) % 1000) / 1000.0)
+
+
+def planned_times(lines, total: float):
+    """Planned boot time per stamped line; ``"time": null`` stays untimed.
+
+    Real dmesg is dense at t~0 and spreads out as boot progresses, so the gaps
+    ramp up cubically.  The decompressor lines run before printk and do not
+    advance the clock.
+    """
+    idx = [i for i, e in enumerate(lines) if e.get("time", "auto") is not None]
+    n = len(idx)
+    times = [None] * len(lines)
+    if n == 0:
+        return times
+    weights = [0.0] + [(j / (n - 1)) ** 3 * _jitter(j) for j in range(1, n)]
+    scale = total / sum(weights) if sum(weights) else 0.0
+    t = 0.0
+    for j, i in enumerate(idx):
+        t += weights[j] * scale
+        times[i] = t
+    return times
+
+
+def unescape(s: str) -> str:
+    r"""Turn the readable `\e` marker into a real ESC (0x1b) for ANSI SGR."""
+    return s.replace("\\e", "\x1b")
+
+
+def build(registry: dict, tarball: str):
+    lines = registry["lines"]
+    files = sorted({e["file"] for e in lines})
+    ensure_sources(files, tarball)
+
+    cache = os.path.join(root(), "tools", ".cache", "src")
+    contents = {}
+    for rel in files:
+        with open(os.path.join(cache, rel), "rb") as fh:
+            contents[rel] = fh.read().decode("latin-1")
+
+    problems = []
+    entries = []
+    times = planned_times(lines, registry.get("log_span_seconds", 0.95))
+    prev = 0.0
+    for i, e in enumerate(lines, 1):
+        rel, match = e["file"], e["match"]
+        if match not in contents[rel]:
+            problems.append(f"  line {i}: {rel}: match not found: {match!r}")
+            continue
+        t = times[i - 1]
+        raw = t is None
+        delta = 0.0 if raw else max(0.0, t - prev)
+        if not raw:
+            prev = t
+        entries.append({"t": unescape(e["text"]), "d": round(delta, 6), "raw": raw})
+
+    if problems:
+        print("anchor verification FAILED:", file=sys.stderr)
+        print("\n".join(problems), file=sys.stderr)
+        raise SystemExit(1)
+
+    # The init/systemd phase is not in the kernel tree; it is hand-written in
+    # data/userland.txt and appended verbatim (also unstamped: it is userspace).
+    userland = os.path.join(root(), "data", "userland.txt")
+    if os.path.exists(userland):
+        with open(userland) as fh:
+            for ln in unescape(fh.read()).split("\n"):
+                if ln == "":
+                    continue
+                entries.append({"t": ln, "d": 0.03, "raw": True})
+
+    return entries
+
+
+def write_outputs(entries) -> None:
+    r = root()
+    txt_path = os.path.join(r, "data", "bootlog.txt")
+    js_path = os.path.join(r, "src", "bootlog.data.js")
+    os.makedirs(os.path.dirname(txt_path), exist_ok=True)
+
+    with open(txt_path, "w") as fh:
+        fh.write("\n".join(e["t"] for e in entries) + "\n")
+
+    header = (
+        "// GENERATED by tools/build_bootlog.py -- do not edit.\n"
+        "// Each line is anchored to a Linux 7.2.8 printk format string\n"
+        "// (see tools/registry.json).  `d` is the planned delay in seconds;\n"
+        "// the `[  sec.usec]` timestamps are generated at runtime from the\n"
+        "// measured elapsed time, not baked in here.\n"
+    )
+    with open(js_path, "w") as fh:
+        fh.write(header)
+        fh.write("window.LW = window.LW || {};\n")
+        fh.write("window.LW.KLOG = " + json.dumps(entries, ensure_ascii=False) + ";\n")
+
+    print(f"  wrote data/bootlog.txt ({len(entries)} lines)")
+    print("  wrote src/bootlog.data.js")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--registry", default=os.path.join(root(), "tools", "registry.json"))
+    ap.add_argument("--tarball", default=DEFAULT_TARBALL)
+    args = ap.parse_args()
+
+    if not os.path.exists(args.tarball):
+        print(f"note: tarball {args.tarball} not found; using the source cache")
+
+    reg = load_registry(args.registry)
+    print(f"kernel: {reg.get('kernel', '?')}, {len(reg['lines'])} anchored lines")
+    entries = build(reg, args.tarball)
+    write_outputs(entries)
+    print("boot log OK")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
