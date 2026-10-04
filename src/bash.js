@@ -9,6 +9,17 @@
 (function (LW) {
   "use strict";
 
+  // ctrlChar is defined by renderer.js in the real page; give a minimal
+  // equivalent so this shell still parses Ctrl chords headless.
+  if (!LW.ctrlChar) {
+    LW.ctrlChar = function (ev) {
+      if (ev.key && ev.key.length === 1 && /^[a-zA-Z@\[\\\]^_?]$/.test(ev.key)) {
+        return ev.key.toLowerCase();
+      }
+      return null;
+    };
+  }
+
   var V = LW.VFS;
   var USER = V.USER, HOST = V.HOST, HOME = V.HOME;
   var ESC = "\x1b[";
@@ -394,6 +405,108 @@
     return o;
   }
 
+  // ---------------- GNU-style option parsing (getopt_long) ----------------
+  //
+  // coreutils parses with getopt_long and words every failure itself:
+  //
+  //     $ cat -Z
+  //     cat: invalid option -- 'Z'
+  //     Try 'cat --help' for more information.
+  //
+  // getopt() walks argv exactly that way.  Options may follow operands (GNU
+  // getopt permutes), `--` ends the option list, and the walk stops at the
+  // first of --help, --version or a bad option -- which is what makes
+  // `cat --help -Z` succeed while `cat -Z --help` fails.
+  //
+  //     spec = { short: { n: "bool", c: "arg" },     // "arg" eats a value
+  //              long:  { number: "bool",            // value = the key
+  //                       count: ["arg", "c"] },     // [kind, key] to alias
+  //              exit: 1,                            // status on a usage error
+  //              helpShort: "h", versionShort: "V" } // only if really accepted
+  //
+  //     g = getopt("cat", args, spec)
+  //     -> { o: { n: true }, _: [operands], err: null|"cat: invalid ...",
+  //          help: false, version: false, exit: 1 }
+  //
+  // finish() answers g the way coreutils does; pass it your shell and name.
+  function getopt(prog, args, spec) {
+    spec = spec || {};
+    var shortSpec = spec.short || {}, longSpec = spec.long || {};
+    var o = {}, out = [], i = 0, exit = spec.exit || 1;
+    function done(err) {
+      return { o: o, _: out, err: err || null, help: false, version: false, exit: exit };
+    }
+    function doneWith(flag) {
+      var r = done(null);
+      r[flag] = true;
+      return r;
+    }
+    while (i < args.length) {
+      var a = args[i++];
+      if (a === "--") { out = out.concat(args.slice(i)); i = args.length; break; }
+      if (a.length < 2 || a.charAt(0) !== "-") { out.push(a); continue; }
+      if (a.charAt(1) === "-") {                                  // --long[=value]
+        var eq = a.indexOf("="), name = eq < 0 ? a.slice(2) : a.slice(2, eq);
+        if (name === "help") return doneWith("help");
+        if (name === "version") return doneWith("version");
+        var has = Object.prototype.hasOwnProperty.call(longSpec, name);
+        if (!has) {
+          return done(prog + ": unrecognized option '" + (eq < 0 ? a : a.slice(0, eq)) + "'");
+        }
+        var le = longSpec[name], lk = typeof le === "string" ? name : le[1];
+        var kind = typeof le === "string" ? le : le[0];
+        if (kind === "bool") {
+          if (eq >= 0) return done(prog + ": option '--" + name + "' doesn't allow an argument");
+          o[lk] = true;
+        } else if (eq >= 0) {
+          o[lk] = a.slice(eq + 1);
+        } else if (i < args.length) {
+          o[lk] = args[i++];
+        } else {
+          return done(prog + ": option '--" + name + "' requires an argument");
+        }
+        continue;
+      }
+      var chars = a.slice(1);                                    // -abc / -cVALUE
+      for (var k = 0; k < chars.length; k++) {
+        var c = chars.charAt(k);
+        if (spec.helpShort && c === spec.helpShort) return doneWith("help");
+        if (spec.versionShort && c === spec.versionShort) return doneWith("version");
+        var se = Object.prototype.hasOwnProperty.call(shortSpec, c) ? shortSpec[c] : null;
+        if (se === null) return done(prog + ": invalid option -- '" + c + "'");
+        if (se === "bool") { o[c] = true; continue; }
+        var val = chars.slice(k + 1);
+        if (!val) {
+          if (i < args.length) val = args[i++];
+          else return done(prog + ": option requires an argument -- '" + c + "'");
+        }
+        o[c] = val;
+        break;                                                    // the value ate the rest
+      }
+    }
+    return done(null);
+  }
+
+  // The `--help` / `--version` text of a coreutils program, captured verbatim
+  // from the real binary by tools/gen_coreutils_help.py.
+  function doc(prog, which) {
+    var t = which === "version" ? LW.CUVER : LW.CUHELP;
+    var rows = t && t[prog];
+    return rows && rows.length ? rows.join("\n") + "\n" : "";
+  }
+
+  // Answer --help / --version / a getopt failure, or return null to carry on.
+  function finish(sh, prog, g, code) {
+    if (g.help) return { out: doc(prog, "help"), code: 0 };
+    if (g.version) return { out: doc(prog, "version"), code: 0 };
+    if (g.err) {
+      sh._error(g.err);
+      sh._error("Try '" + prog + " --help' for more information.");
+      return { out: "", code: code === undefined ? g.exit : code };
+    }
+    return null;
+  }
+
   function human(n) {
     var u = ["", "K", "M", "G", "T"], i = 0; n = Number(n);
     while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
@@ -480,19 +593,142 @@
     return { out: res, code: 0 };
   }, "ls - list directory contents");
 
-  defCmd("cat", function (args, stdin, sh) {
-    var o = opt(args, { bool: "nEbA" });
-    var text = "";
-    if (!o._.length) text = stdin;
-    else for (var i = 0; i < o._.length; i++) {
-      var d = V.readFile(sh.path(o._[i]));
-      if (d === null) { sh._error("cat: " + o._[i] + ": No such file or directory"); return { out: "", code: 1 }; }
-      text += d;
+  // ---- cat
+  //
+  // coreutils' cat, spelled out.  The options fold the way GNU's do
+  // (-A = -vET, -e = -vE, -t = -vT), -b overrides -n, the line number runs
+  // on across every file and across stdin, and -s squeezes blank lines
+  // globally rather than per file.  Files are concatenated into one stream
+  // first, so a file with no trailing newline simply runs into the next one:
+  // with f = "x", `cat -n f f` prints a single numbered line "xx".
+  //
+  // A file that cannot be read is reported on stderr and everything else is
+  // still printed, with a final status of 1 -- `cat nope f` prints f.
+  // `-` is stdin, read once; a second `-` sees end of file, like a pipe.
+  function utf8Bytes(s) {
+    var out = [];
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+      else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length &&
+               s.charCodeAt(i + 1) >= 0xdc00 && s.charCodeAt(i + 1) <= 0xdfff) {
+        var cp = 0x10000 + ((c - 0xd800) << 10) + (s.charCodeAt(i + 1) - 0xdc00);
+        out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f),
+                 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+        i++;
+      } else out.push(0xef, 0xbf, 0xbd);                 // lone surrogate -> U+FFFD
     }
-    if (o.n) text = text.replace(/\n$/, "").split("\n").map(function (l, i) { return String(i + 1).padStart(6) + "\t" + l; }).join("\n") + "\n";
-    if (o.E || o.b || o.A) text = text.replace(/\n/g, "$\n");
-    return { out: text, code: 0 };
+    return out;
+  }
+  // -v's notation: ^@..^_ for controls, ^? for DEL, M- for the high bit,
+  // applied to the UTF-8 *bytes* -- which is why `cat -v` on "é" prints
+  // M-CM-), not é.
+  function showByte(b, showTabs) {
+    if (b < 32) {
+      if (b === 9) return showTabs ? "^I" : "\t";
+      if (b === 10) return "\n";
+      return "^" + String.fromCharCode(b + 64);
+    }
+    if (b < 127) return String.fromCharCode(b);
+    if (b === 127) return "^?";
+    return "M-" + showByte(b - 128, showTabs);
+  }
+  // The one canonical option set, shared by the defCmd and by the terminal
+  // capture path in the shell (bare `cat` reading the tty).
+  var CAT_OPTS = {
+    short: { A: "bool", b: "bool", e: "bool", E: "bool", n: "bool",
+             s: "bool", t: "bool", T: "bool", u: "bool", v: "bool" },
+    long: {
+      "show-all": ["bool", "A"], "number-nonblank": ["bool", "b"],
+      "show-ends": ["bool", "E"], number: ["bool", "n"],
+      "squeeze-blank": ["bool", "s"], "show-tabs": ["bool", "T"],
+      "show-nonprinting": ["bool", "v"],
+    },
+  };
+  // Fold -A/-e/-t into the -vET family and render a whole input string as
+  // cat would.  Pure function (no shell, no streams) so the terminal capture
+  // path can call it incrementally and cut off only what has grown.
+  function catFormat(o, data) {
+    var oo = {};
+    for (var kk in o) oo[kk] = o[kk];
+    if (oo.A) { oo.v = true; oo.E = true; oo.T = true; }
+    if (oo.e) { oo.v = true; oo.E = true; }
+    if (oo.t) { oo.v = true; oo.T = true; }
+    var decorate = !!(oo.v || oo.T), ends = !!oo.E, squeeze = !!oo.s;
+    var nonblank = !!oo.b, number = !!oo.b || !!oo.n;    // -b wins over -n
+
+    var endsInNl = data.slice(-1) === "\n";
+    var parts = data.split("\n");
+    if (parts.length && parts[parts.length - 1] === "") parts.pop();
+    var out = "", no = 1, prevBlank = false;
+    for (var j = 0; j < parts.length; j++) {
+      var line = parts[j];
+      if (squeeze && line === "" && prevBlank) continue;
+      var body = line;
+      if (decorate) {
+        var bs = utf8Bytes(line), s = "";
+        for (var b = 0; b < bs.length; b++) s += showByte(bs[b], !!oo.T);
+        body = s;
+      }
+      if (number && (!nonblank || line !== "")) {
+        body = String(no).padStart(6) + "\t" + body;
+        no++;
+      }
+      // every line carries a newline except the last one of an input that
+      // did not end in one -- and -E only marks the newlines it sees.
+      var nl = (j < parts.length - 1 || endsInNl) ? "\n" : "";
+      if (ends && nl) body += "$";
+      out += body + nl;
+      prevBlank = line === "";
+    }
+    return out;
+  }
+  defCmd("cat", function (args, stdin, sh) {
+    var g = getopt("cat", args, CAT_OPTS);
+    var done = finish(sh, "cat", g);
+    if (done) return done;
+
+    var files = g._.length ? g._ : ["-"], data = "", code = 0, stdinTaken = false;
+    for (var i = 0; i < files.length; i++) {
+      var name = files[i];
+      if (name === "-") { if (!stdinTaken) { data += stdin || ""; stdinTaken = true; } continue; }
+      var p = sh.path(name), n = V.getNode(p);
+      if (n && n.t === "d") {
+        sh._error("cat: " + name + ": Is a directory"); code = 1; continue;
+      }
+      if (!n) {
+        sh._error("cat: " + name + ": No such file or directory"); code = 1; continue;
+      }
+      var d = V.readFile(p);
+      if (d === null) { sh._error("cat: " + name + ": No such file or directory"); code = 1; continue; }
+      data += d;
+    }
+    return { out: catFormat(g.o, data), code: code };
   }, "cat - concatenate files and print");
+
+  // A bare `cat` -- no files, no redirection, no pipe, terminal as stdin --
+  // has nothing to do yet, so the shell runs it interactively (see the
+  // capture path below): each line you type is copied, live, like a real
+  // tty, and Ctrl-D ends the copying.  Returns null if this line is not the
+  // bare terminal form.
+  function catTerminalArgs(line) {
+    var s = line.trim();
+    if (!s) return null;
+    // any structural character means this cat is part of a bigger command
+    if (/[`|;&<>()]/.test(s) || /\$\(/.test(s)) return null;
+    var toks = s.split(/\s+/);
+    if (toks[0] !== "cat" || toks.length === 0) return null;
+    var seenDashdash = false;
+    for (var i = 1; i < toks.length; i++) {
+      var t = toks[i];
+      if (t === "--") { if (seenDashdash) return null; seenDashdash = true; continue; }
+      if (!seenDashdash && t.charAt(0) === "-" && t.length > 1 && t !== "--") continue;
+      if (t === "-" || t === "/dev/stdin" || t === "/dev/fd/0") continue;
+      return null;                                     // a real file operand
+    }
+    return toks.slice(1);
+  }
 
   function headTail(name, fromEnd) {
     defCmd(name, function (args, stdin, sh) {
@@ -833,14 +1069,15 @@
       return { out: "", code: 0 };
     }
     var s = V.stats();
-    return { out: lines([
+    var rows = [
       "idbfs on / type idbfs (rw,auto-persist=" + s.autoPersist + ")",
       "  store:    " + (s.open ? "linuxweb-vfs (IndexedDB)" : "not mounted"),
       "  records:  " + s.records + " (" + s.files + " files, " + s.dirs + " dirs)",
       "  bytes:    " + s.bytes,
       "  pending:  " + s.pending + " write(s) queued",
       s.error ? "  error:    " + s.error : "",
-    ].filter(Boolean)), code: 0 };
+    ].filter(Boolean);
+    return { out: rows.join("\n") + "\n", code: 0 };
   }, "inspect the IndexedDB filesystem");
 
   defCmd("lsblk", function () {
@@ -1110,6 +1347,57 @@
     return { out: (pages[t] || [t.toUpperCase() + "(1)", "", "NAME", "       no manual entry for " + t]).join("\n") + "\n", code: 0 };
   }, "an interface to the system reference manuals");
 
+  // ---- bash / sh -------------------------------------------------------------
+  //
+  // Running `bash` by itself starts a real interactive sub-shell on the same
+  // tty and drops back to the parent on `exit` (or Ctrl-D on an empty line),
+  // exactly a real login.  `bash -c 'LINE'` runs the string and
+  // `bash script.sh` runs the script, like the real thing.
+  function shProgram(prog, args, stdin, sh) {
+    var scriptIdx = -1;
+    for (var i = 0; i < args.length; i++) {
+      var a = args[i];
+      if (a === "--") break;
+      if (a === "-c" || (a.charAt(0) === "-" && a.charAt(1) !== "-" && a.indexOf("c") >= 0)) {
+        scriptIdx = i + 1; break;
+      }
+      if (a.charAt(0) !== "-") break;      // a script path
+    }
+    if (scriptIdx >= 0) {
+      if (scriptIdx >= args.length) {
+        sh._error(prog + ": -c: option requires an argument");
+        return { out: "", code: 2 };
+      }
+      try {
+        sh.runLine(args[scriptIdx], false);
+      } catch (e) {
+        // an exit in the -c script ends it, not the parent shell
+        if (!(e && (e.__exit !== undefined || e.__return !== undefined))) throw e;
+      }
+      return { out: sh.lastOut, code: sh.status };
+    }
+    if (args.length && args[0].charAt(0) !== "-") {
+      var d = V.readFile(sh.path(args[0]));
+      if (d === null) { sh._error(prog + ": " + args[0] + ": No such file or directory"); return { out: "", code: 127 }; }
+      return sh.bi_source([args[0]]);
+    }
+    // interactive: a fresh shell on the same tty keeps the user's identity,
+    // working directory, and environment, the way a real sub-shell does
+    var child = new Shell(sh.term);
+    child.applyUser(sh.env.USER || USER);
+    for (var k in sh.env) child.env[k] = sh.env[k];
+    child.cwd = sh.cwd;
+    child.env.PWD = sh.cwd;
+    child.status = sh.status;
+    sh._child = child;
+    child.start(false);
+    return { out: "", code: 0 };
+  }
+  defCmd("bash", function (args, stdin, sh) { return shProgram("bash", args, stdin, sh); },
+    "bash - GNU Bourne-Again SHell");
+  defCmd("sh", function (args, stdin, sh) { return shProgram("sh", args, stdin, sh); },
+    "sh - invoke the GNU command interpreter");
+
   // ===================== shell =====================
 
   function decodePrompt(s, sh) {
@@ -1219,6 +1507,18 @@
   };
 
   Shell.prototype.runLine = function (line, silent) {
+    this.lastOut = "";
+    // A bare `cat` (flags only, no files, no redirections) runs as a terminal
+    // reader: it consumes the keystrokes typed next and copies them live.
+    var cap = catTerminalArgs(line);
+    if (cap) {
+      var g0 = getopt("cat", cap, CAT_OPTS);
+      if (!g0.err && !g0.help && !g0.version) {
+        this._capture = { buf: "", printed: 0, pending: "", o: g0.o };
+        this.status = 0;
+        return 0;
+      }
+    }
     var toks = new Lexer(line, this).run();
     this.lastOut = "";
     if (!toks.length) { this.status = 0; return 0; }
@@ -1836,6 +2136,67 @@
     t.render();
   };
 
+  // Interactive tty capture: a bare `cat` copies each typed line back,
+  // live, through cat's own filter, the way a real cat does on a terminal:
+  // the line appears once as the tty echoes it, and cat's copy follows on
+  // the next line.  Ctrl-D ends the copying, Ctrl-C kills it.
+  Shell.prototype._captureKey = function (ev) {
+    var t = this.term, cap = this._capture, k = ev.key;
+    if (ev.ctrlKey && !ev.altKey) {
+      var c = LW.ctrlChar(ev);
+      if (c === "c") {
+        t.write("^C\n");
+        this._capture = null; this.status = 130; this.newPrompt();
+        return;
+      }
+      if (c === "d") {
+        // canonical EOF: the characters typed so far are delivered first.
+        if (cap.pending.length > 0) {
+          cap.buf += cap.pending;
+          var s0 = catFormat(cap.o, cap.buf);
+          var d0 = s0.slice(cap.printed);
+          if (d0) t.write(d0);
+          cap.printed = s0.length;
+          cap.pending = "";
+        }
+        t.write("\n");
+        this._capture = null; this.status = 0; this.newPrompt();
+        return;
+      }
+      return;                                        // other chords ignored
+    }
+    if (ev.altKey || ev.metaKey) return;
+    switch (k) {
+      case "Enter": {
+        var line = cap.pending; cap.pending = "";
+        cap.buf += line + "\n";
+        t.write("\n");
+        var s1 = catFormat(cap.o, cap.buf);
+        var d1 = s1.slice(cap.printed);
+        if (d1) t.write(d1);
+        cap.printed = s1.length;
+        t.render();
+        return;
+      }
+      case "Backspace":
+        if (cap.pending.length > 0) {
+          cap.pending = cap.pending.slice(0, -1);
+          t.write("\b \b");
+          t.render();
+        }
+        return;
+      case "Escape":
+        t.write("^C\n");
+        this._capture = null; this.status = 130; this.newPrompt();
+        return;
+    }
+    if (k && k.length === 1) {
+      cap.pending += k;
+      t.write(k);
+      t.render();
+    }
+  };
+
   Shell.prototype.submit = function () {
     var t = this.term, line = this.buf;
     t.write("\n");
@@ -1855,6 +2216,8 @@
       if (this._asyncTask) { this.runAsync(t); return; }
       t.render();
     }
+    // a child shell or an interactive terminal cat owns the screen now
+    if (this._child || this._capture) return;
     if (this.running) this.newPrompt();
   };
 
@@ -2203,6 +2566,22 @@
   Shell.prototype.onKey = function (ev) {
     var t = this.term, k = ev.key;
 
+    // bare `cat` on a tty: the keystrokes drive the capture buffer.
+    if (this._capture) { this._captureKey(ev); return true; }
+
+    // a child bash owns the keys while it runs (exits drop back here)
+    if (this._child) {
+      var ch = this._child;
+      ch.onKey(ev);
+      if (!ch.running) {
+        var self = this;
+        self.status = ch.status;
+        self._child = null;
+        self.newPrompt();
+      }
+      return true;
+    }
+
     if (this.busy) {
       var io = this._asyncIO;
       if (ev.ctrlKey && k === "c") { this.abortAsync(); return true; }
@@ -2291,6 +2670,49 @@
     this.running = true;
     if (motd !== false) this.printMotd();
     this.newPrompt();
+  };
+
+  // The most common coreutils failure wording:  `prog: name: strerror`.
+  // Programs that say something else (head, sort, tac, cp, ...) format it
+  // themselves -- the difference is exactly what you see on a real machine.
+  function gnuErr(prog, name, kind) {
+    return prog + ": " + name + ": " +
+      (kind === "dir" ? "Is a directory"
+        : kind === "perm" ? "Permission denied"
+          : "No such file or directory");
+  }
+
+  // Walk a command's inputs: "-" (or no operand at all) is stdin, read at
+  // most once per invocation, and an unreadable input is reported through
+  // errFmt while the rest keeps going.  fn(text, name) sees each one; name
+  // is null for stdin.  Returns the status coreutils would return.
+  function eachInput(prog, args, stdin, sh, errFmt, fn) {
+    var files = args.length ? args : ["-"], code = 0, taken = false;
+    for (var i = 0; i < files.length; i++) {
+      var name = files[i];
+      if (name === "-") {
+        if (!taken) { fn(stdin || "", null); taken = true; }
+        continue;
+      }
+      var p = sh.path(name), n = V.getNode(p), kind = null;
+      if (!n) kind = "missing";
+      else if (n.t === "d") kind = "dir";
+      var d = kind ? null : V.readFile(p);
+      if (d === null && !kind) kind = "missing";
+      if (kind) { sh._error((errFmt || gnuErr)(prog, name, kind)); code = 1; continue; }
+      fn(d, name);
+    }
+    return code;
+  }
+
+  // The coreutils register.  src/coreutils_*.js define their commands with
+  // LW.core.defCmd() after this file has loaded, and share its option
+  // parser, so `cp` and `cat` fail the same way coreutils does.
+  LW.core = {
+    defCmd: defCmd, defBui: defBui, opt: opt,
+    getopt: getopt, finish: finish, doc: doc,
+    eachInput: eachInput, gnuErr: gnuErr,
+    sgr: sgr, human: human, CMDS: CMDS,
   };
 
   LW.Shell = Shell;

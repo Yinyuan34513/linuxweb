@@ -71,15 +71,29 @@
   };
 
   // ------------------------------------------------------------ the tree ---
+  // Random bytes as raw characters (one byte = one char code).  The content
+  // is binary w.r.t. the rest of the shell, exactly like a real
+  // /dev/urandom, so `od`, `tr` etc. see the same range of byte values.
+  function randomBytes(n) {
+    var s = "";
+    while (s.length < n) {
+      s += String.fromCharCode(Math.floor(Math.random() * 256));
+    }
+    return s.slice(0, n);
+  }
+
   function nodeFor(n) {
     return {
       t: "f", dev: true, devType: n.type,
       major: n.major, minor: n.minor, class: n.class, driver: n.driver,
       get: function () {
-        switch (n.class) {
+        // the special-purpose devices are identified by name; each read is
+        // fresh, like the real drivers (so /dev/urandom is real random).
+        switch (n.name) {
           case "zero": return "\u0000".repeat(512);
           case "null": return "";
-          case "random": return "\u0000".repeat(4);
+          case "random":
+          case "urandom": return randomBytes(512);
           case "kmsg": return LW.stampedLog || "";
           default: return "";
         }
