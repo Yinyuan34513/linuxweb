@@ -1,5 +1,11 @@
 # Extracted kernel/bash sources — regenerated on demand by tools/*.py
 tools/.cache/
+tools/.wasmbuild/
+
+# unrelated checkouts that happen to sit inside the project directory
+/file/
+/miku-proxy/
+/xapi-compat/
 
 # Editor / OS noise
 *~

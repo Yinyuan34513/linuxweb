@@ -1722,7 +1722,14 @@
     if (res.async && res.start) {          // takes over the terminal
       this._asyncTask = res.start;
       this.status = 0;
-      return { out: "", err: errText };
+      // `cmd 2>&1` still merges for an async command: whatever it wrote to
+      // stderr before taking over is emitted through the task, which owns
+      // the only stdout there is.
+      if (mergeErr && errText) {
+        var start = res.start;
+        this._asyncTask = function (io) { io.write(errText); return start(io); };
+      }
+      return { out: "", err: mergeErr ? "" : errText };
     }
     this.status = res.code === undefined ? 0 : res.code;
     var outText = res.out || "";

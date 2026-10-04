@@ -47,22 +47,115 @@ src/vfs.js            IDBFS: the IndexedDB-backed virtual filesystem
 src/devtmpfs.js       devtmpfs: /dev generated from a device registry
 src/apt.js            apt/dpkg + the package catalogue
 src/bash.js           the shell: lexer, parser, executor, builtins, line editor
+src/coreutils_help.js GENERATED  verbatim `--help` / `--version` of coreutils 9.x
+src/coreutils_text.js coreutils text filters (wc, head, sort, tr, cut, ...)
+src/coreutils_file.js coreutils file commands (cp, mv, rm, chmod, stat, ...)
+src/coreutils_sys.js  coreutils system commands (uname, date, env, expr, ...)
+src/coreutils_digest.js coreutils checksums (md5sum, sha256sum, base64, ...)
+src/magic.js          `file`, backed by real libmagic
+src/magicmgc.data.js  GENERATED  the system magic.mgc, gzipped + base64
 src/getty.js          getty(8) + login(1)
 src/main.js           boot replay (runtime timestamps) + console wiring
+assets/libmagic.js    GENERATED  file(1)'s libmagic compiled to WebAssembly
 tools/extract_font.py      font_8x16.c   -> assets/font8x16.bin + src/font.data.js
 tools/build_bootlog.py     registry.json -> data/bootlog.txt + src/bootlog.data.js
 tools/gen_bash_strings.py  bash-5.3      -> src/bash.data.js
 tools/gen_bash_help.py     bash-5.3 .def -> src/help.js (+ `bind -P`, `set -o`)
+tools/gen_coreutils_help.py coreutils 9.x -> src/coreutils_help.js
+tools/build_libmagic.sh     file-5.45     -> assets/libmagic.js (needs emcc)
+tools/gen_magicmgc.js       a .mgc, data/magic or a file(1) tree
+                                         -> src/magicmgc.data.js
+tools/verify_magic.js       the wasm libmagic against the system's `file`
+tools/libmagic_wasm.c       the exported entry points into libmagic
 tools/registry.json        ordered, anchored boot steps (the source of truth)
 tools/test_shell.js        shell test suite
 tools/test_getty.js        sha256 / getty / IDBFS test suite
 tools/test_render.js       ANSI colour + attribute test suite
 tools/test_vt.js           VT escape-engine test suite
 tools/test_dev_apt.js      devtmpfs + apt test suite
+tools/test_magic.js        libmagic / `file` test suite
 data/bootlog.txt      GENERATED  messages only, no timestamps
 data/userland.txt     hand-written init/systemd phase
+data/magic            optional curated database (the page ships the full one)
 assets/font8x16.bin   GENERATED  raw 4096 bytes
 ```
+
+## `file` is the real libmagic
+
+`file` is not a guess here. `assets/libmagic.js` is **file(1)'s own library**
+(`src/apprentice.c`, `softmagic.c`, `ascmagic.c`, `readelf.c`, `is_json.c`,
+`is_tar.c`, …) compiled to WebAssembly with Emscripten, and the database is the
+**system's** `/usr/share/misc/magic.mgc` — the same bytes the machine's `file`
+uses. So `file` here runs the same code paths, over the same rules:
+
+```sh
+file /etc/hostname     # /etc/hostname: ASCII text
+file /boot/vmlinuz-7.2.8
+file -I /tmp/x.json    # mime type only
+file -b /dev/sda       # brief, no name column
+```
+
+Details that only come out right if it is the real thing:
+
+- the name column is padded to the widest operand, with `-F` as the separator;
+- a file that cannot be opened is reported as
+  ``file: cannot open `x' (No such file or directory)`` **and file still exits 0**;
+- a symlink is reported as a symlink unless `-L` is given;
+- an ELF gets the full description — `pie executable, dynamically linked,
+  interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=…, for GNU/Linux 3.2.0,
+  stripped` — which `readelf.c` gets by `pread()`-ing the program headers and
+  PT_NOTE sections. That is why `src/magic.js` hands libmagic a file rather than
+  a buffer.
+
+### It is verified against the real `file`, not assumed
+
+`tools/verify_magic.js` runs the same buffers through both: the wasm build with
+the embedded database, and the system's `file -b -m` with the same one.
+
+```console
+$ node tools/verify_magic.js
+416 identical, 0 different, 416 files
+```
+
+416 files — every ELF in `/bin`, configs, docs, images, archives, plus synthetic
+samples (JSON, CSV, gzip, zip, PNG, PDF, tar, wasm, UTF-8, random) — and not one
+byte of difference.
+
+### Rebuilding it
+
+The database is 8.1 MB, which is why `src/magicmgc.data.js` carries it gzipped
+(383 KB) and `src/magic.js` inflates it with `DecompressionStream` before
+loading it.
+
+```sh
+git -C ../file fetch --depth 1 origin tag FILE5_45        # the mgc's version
+git -C ../file worktree add ../file545 FILE5_45
+. ~/gnos/emsdk/emsdk_env.sh
+sh tools/build_libmagic.sh ../file545                     # -> assets/libmagic.js
+node tools/gen_magicmgc.js assets/libmagic.js /usr/share/misc/magic.mgc \
+     src/magicmgc.data.js
+node tools/verify_magic.js && node tools/test_magic.js
+```
+
+The library has to be the same release as the database — `magic_load()` reads
+the records as `struct magic`, and the struct grew in 5.46, so a 5.48 library
+rejects a 5.45 `magic.mgc` outright. Two `#define`s in `tools/build_libmagic.sh`
+matter for correctness, not just for compiling: `BUILTIN_ELF` (without it
+`readelf.c` compiles to a stub and every ELF is "shared object") and `ELFCORE`
+(where the note-parsing flag bookkeeping lives).
+
+To compile a database instead of embedding the system's — for instance a much
+smaller page — pass either our curated `data/magic` or the complete Magdir:
+
+```sh
+node tools/gen_magicmgc.js assets/libmagic.js data/magic src/magicmgc.data.js
+node tools/gen_magicmgc.js assets/libmagic.js ../file545 src/magicmgc.data.js all
+```
+
+A compiled database has to be produced *by the library that reads it* (the
+format is versioned and `magic_load()` rejects a mismatch), which is why that
+step runs the wasm module under node and calls `magic_compile()` inside it
+rather than shelling out to the system `file`.
 
 ## Login
 
@@ -380,7 +473,11 @@ calls `io.done(code)`, writing through `io.write`. That is what drives `sl`,
 - Only the 8x16 glyph is used. The hardware 9th "line graphics" column that
   `vgacon` can generate is a CRTC-side feature and intentionally out of scope.
 - Font data is derived from GPL-2.0 Linux source (`lib/fonts/font_8x16.c`); the
-  banner strings come from GPL-3.0 bash 5.3.
+  banner strings come from GPL-3.0 bash 5.3; `assets/libmagic.js` is
+  BSD-licensed file(1) 5.48.
 - No job control (`C-z`, `bg`, `fg`, `wait` are accepted but inert), no job
   pipelines across processes, and no multi-line `if`/`for`/`while` bodies — the
   shell is a single-page simulator, not a process-based shell.
+- `cat` with no operands on a terminal is an interactive reader: keystrokes are
+  captured and copied back through cat's own filter until `Ctrl+D`. With a pipe
+  or a redirect it is an ordinary filter again.

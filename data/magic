@@ -1,0 +1,48 @@
+# A deliberately small magic database for the console's `file` command.
+#
+# file(1)'s own database is 10.8 MB and libmagic reads all of it into memory
+# on magic_load(); that is far too much to ship with a web page.  These are
+# the formats that can actually appear in this filesystem -- what the seed
+# tree contains, what apt/apt-get download, and what a user can create with
+# base64, curl or a heredoc.  Everything else is still recognised, because
+# text, JSON, CSV, tar and ELF detection live in libmagic's own code
+# (ascmagic.c, is_json.c, is_csv.c, is_tar.c, readelf.c), not in this file.
+#
+# Recompile after editing:
+#   node tools/gen_magicmgc.js assets/libmagic.js . src/magicmgc.data.js data/magic
+
+# ---- executables -------------------------------------------------------------
+0	string	\177ELF			ELF
+0	string	MZ			MS-DOS executable
+0	string	#!			POSIX shell script executable
+
+# ---- archives and compression ------------------------------------------------
+0	string	PK\003\004		Zip archive data, at least v2.0 to extract
+0	string	PK\005\006		Zip archive data (empty)
+0	string	PK\007\010		Zip archive data, at least v2.0 to extract
+0	string	\037\213\010		gzip compressed data
+0	string	\037\213\011		gzip compressed data
+0	string	BZh			bzip2 compressed data
+0	string	\375\106\375\070	xz compressed data
+0	string	\211LZO			LZO compressed data
+0	string	\004\357\063\177	Data packed with the "pack" tool
+257	string	ustar		POSIX tar archive (GNU)
+257	string	ustar  \0	POSIX tar archive (GNU)
+0	string	Rar!\032\007\000	RAR archive data, v1.5
+
+# ---- images ------------------------------------------------------------------
+0	string	\211PNG\015\012\032\012	PNG image data
+0	string	\377\330\377\340	JPEG image data
+0	string	\377\330\377\341	JPEG image data
+0	string	GIF87a			GIF image data, version 87a
+0	string	GIF89a			GIF image data, version 89a
+0	string	RIFF			RIFF (little-endian) data
+0	string	BM			PC bitmap, Windows 3.x format
+
+# ---- documents and misc ------------------------------------------------------
+0	string	%PDF-			PDF document
+0	string	{\\rtf			Rich Text Format data
+0	string	\375\006\000\000sparc	Sparc archive data
+0	string	\177\376			CoreDOS
+0	string	SQLite format 3\000	SQLite 3.x database
+0	string	\000asm			WebAssembly binary module
