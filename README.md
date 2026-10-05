@@ -50,7 +50,8 @@ src/bash.js           the shell: lexer, parser, executor, builtins, line editor
 src/coreutils_help.js GENERATED  verbatim `--help` / `--version` of coreutils 9.x
 src/coreutils_text.js coreutils text filters (wc, head, sort, tr, cut, ...)
 src/coreutils_file.js coreutils file commands (cp, mv, rm, chmod, stat, ...)
-src/coreutils_sys.js  coreutils system commands (uname, date, env, expr, ...)
+src/coreutils_sys.js  coreutils system commands + dmesg/systemctl/journalctl
+src/systemd.js        the unit table and the journal they report from
 src/coreutils_digest.js coreutils checksums (md5sum, sha256sum, base64, ...)
 src/magic.js          `file`, backed by real libmagic
 src/magicmgc.data.js  GENERATED  the system magic.mgc, gzipped + base64
@@ -175,6 +176,13 @@ after a short back-off — a retry behaves exactly like the first attempt. Succe
 prints `Last login:` plus `/etc/motd` and starts a login shell; when the shell
 exits you are dropped back to `login:`, like a console.
 
+The `Last login:` line is **generated at login time**, not baked in: it formats
+the *previous* session's time and tty, which are kept in `/var/log/lastlogin`
+(so they survive a reload like any other file), and falls back to the boot time
+when there is no record yet. The fields are read as UTC, because the machine is
+set up in UTC -- `/etc/localtime`, the kernel banner and the boot log all say so
+-- so the line agrees with them whatever timezone the browser runs in.
+
 ## The shell
 
 A bash-style shell — **not** GNU bash. It covers quoting, `$var` / `${var}` /
@@ -214,6 +222,79 @@ logout sync bind` plus `echo printf true false`.
   is honoured; the built-in one is the Debian handler that prints
   `Command 'X' not found, but can be installed with: sudo apt install X`.
 - **`bind`** prints the complete Ctrl+ table below.
+
+## GNU coreutils
+
+The commands are not shallow imitations. Each one is written against what GNU
+coreutils 9.4 actually prints, and `tools/difftest.js` runs a command line
+through **both** the real `/bin/sh` and this shell and compares stdout, stderr
+and exit status -- 177 cases, all matching:
+
+    node tools/difftest.js              # every group
+    node tools/difftest.js wc sort sed  # just these
+
+Things that had to be measured rather than guessed:
+
+- **`wc`** has two layouts. `cat f | wc` pads every count to seven columns;
+  with operands the numbers share one width, taken from the largest *byte*
+  count (which is why `wc -w f1 big` comes out three wide even though its word
+  counts are one digit); a lone standard input is not padded at all. `wc -L`
+  totals a maximum, everything else a sum.
+- **`cksum`** is not IEEE CRC-32. GNU builds its table from a `GEN` polynomial
+  and then folds the file's *length* in before complementing it, so
+  `printf abc | cksum` is 1219131554 where zlib says 891568578.
+- **`comm`** indents by printed column position, so `-1` and `-2` move the
+  remaining columns left instead of leaving a gap.
+- **`od`**'s default format is a little-endian octal word, and a lone trailing
+  byte still fills six columns (`000147`).
+- **`sort -k`** names a *span* between two field offsets, not one field, and
+  falls back to the whole line unless `-s`.
+- **`seq -w`** takes no argument: `seq -w 8 10` prints 08 09 10.
+- **`fmt`** pulls words back rather than leave a stub last line.
+- **`head -3`** is `head -n 3`, and **`od -w 2`** is a file called `2`.
+- **`printf`** reuses its format for each argument, with flags, width and
+  precision, and does *not* expand escapes in a `%s` argument (that is `%b`).
+- **`sed`** is a real stream editor: line addresses (`N`, `N,M`, `$`, `/re/`,
+  `first~step`, `N+N`, and ranges that open and close across lines), `!`,
+  `s///` with `g`/`i`/`p`/`q`, `y///`, `p d q Q = a i c n N P h H g G x b t T`,
+  `{ }`, labels, `-e` more than once, POSIX classes such as `[[:alpha:]]`, and
+  BRE translated to a RegExp -- in which `\(` is a group and a bare `(` is an
+  ordinary character, as in grep.
+
+`src/coreutils_help.js` is generated from the real binaries'
+`--help`/`--version` output for 102 programs, so `ls --help` prints what `ls`
+prints, down to the `Try 'ls --help' for more information.` line that every
+usage error ends with.
+
+## systemd
+
+`systemctl`, `journalctl` and `dmesg` are front ends over one model in
+`src/systemd.js`, so the unit states, the journal and the kernel log cannot
+tell three different stories. The journal begins as the boot: every line the
+console stamped becomes an entry with both a monotonic and a wall-clock time,
+and the unit events systemd would have written are woven in where they belong,
+so `journalctl -b` reads in order.
+
+- **`systemctl`** answers `status`, `list-units`, `list-unit-files`,
+  `is-active`, `is-enabled`, `is-failed`, `start`, `stop`, `restart`, `reload`,
+  `enable`, `disable`, `cat`, `show`, `daemon-reload`, `list-jobs` and
+  `get-default` in systemd's layout -- the coloured state marker, the `Loaded:`
+  and `Active:` lines, `Main PID`, the CGroup and process tree, the unit's
+  newest log lines -- and its exit codes (0 active, 3 not active, 4 for a unit
+  it has never heard of). The unit files are real files, so `systemctl cat ssh`
+  and `cat /lib/systemd/system/ssh.service` show the same text.
+- **`journalctl`** handles `-n -u -k -p -o -r -b -S -U --disk-usage
+  --list-boots`, prints the short format
+  `<when> <host> <ident>[<pid>]: <message>`, and closes with the hints a
+  non-terminal reader gets.
+- **`dmesg`** reads the ring buffer the console printed (`/var/log/dmesg`) with
+  the util-linux option set: `-H` for the wall clock and the offset since the
+  previous line, `-T`, `-t`, `-r`, `-c`, `-C`, `-l`, `-f`, `-F`, `-n`, `--`.
+
+There is no systemd on the machine this runs on, so `tools/test_systemd.js`
+checks these against the published formats and against each other (79 checks:
+the state that `systemctl` reports, the entries `journalctl` prints, and the
+kernel lines `dmesg` shows all agree).
 
 ## Virtual terminals (emuvt)
 

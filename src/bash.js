@@ -429,6 +429,29 @@
     return null;
   }
 
+  // A basic regular expression, as a JavaScript pattern.  grep and sed spell a
+  // group \( \) and put a backslash in front of the punctuation operators,
+  // none of which means anything to a RegExp:
+  //   \( \)  group      \|  alternation
+  //   \+     one or more \?  optional      \{n,m\}  a count
+  // A pattern that still will not compile is matched literally, which is what
+  // grep does with something like "for ((" -- a bare ( is an ordinary character
+  // in a basic regular expression.
+  function brePattern(src) {
+    var out = "", i = 0;
+    var plain = { "{": "}", "|": "|", "+": "+", "?": "?" };
+    while (i < src.length) {
+      var ch = src.charAt(i);
+      if (ch !== "\\") { out += ch; i++; continue; }
+      var next = src.charAt(i + 1);
+      if (next === "\\") { out += "\\\\"; i += 2; continue; }
+      if (next === "(" || next === ")") { out += next; i += 2; continue; }
+      out += Object.prototype.hasOwnProperty.call(plain, next) ? next : "\\" + next;
+      i += 2;
+    }
+    return out;
+  }
+
   function opt(args, spec) {
     var o = { _: [] }, i = 0;
     spec = spec || {};
@@ -884,9 +907,13 @@
     if (o.color === "never") o.color = false;      // --color=never must win
     if (o.color === "auto" && !sh.term) o.color = false;
     if (!o._.length) { sh._error("grep: missing pattern"); return { out: "", code: 2 }; }
-    var pat = o._.shift(), re;
-    try { re = new RegExp(pat, o.i ? "i" : ""); }
-    catch (e) { sh._error("grep: " + pat + ": invalid regular expression"); return { out: "", code: 2 }; }
+    var pat = o._.shift(), re, literal = false;
+    try { re = new RegExp(brePattern(pat), o.i ? "i" : ""); }
+    catch (e) {
+      // not a valid pattern: fall back to matching the text as it stands
+      literal = true;
+      re = null;
+    }
     var files = o._.length ? o._ : ["-"], res = "", status = 1;
     for (var i = 0; i < files.length; i++) {
       var text = files[i] === "-" ? stdin : V.readFile(sh.path(files[i]));
@@ -894,12 +921,15 @@
       var arr = text.split("\n"); if (arr[arr.length - 1] === "") arr.pop();
       var count = 0;
       for (var j = 0; j < arr.length; j++) {
-        if (re.test(arr[j]) !== !!o.v) {
+        var hit = literal ? arr[j].indexOf(pat) >= 0 : re.test(arr[j]);
+        if (hit !== !!o.v) {
           status = 0;
           count++;
           if (o.c) continue;
           var line = ((files.length > 1 && !o.h) ? files[i] + ":" : "") + (o.n ? (j + 1) + ":" : "") + arr[j];
-          if (o.color) line = line.replace(re, function (m) { return sgr("01;31") + m + sgr("0"); });
+          if (o.color && re) {
+            line = line.replace(re, function (m) { return sgr("01;31") + m + sgr("0"); });
+          }
           res += line + "\n";
         }
       }
@@ -984,17 +1014,6 @@
     }
     return { out: res, code: 0 };
   }, "tr - translate or delete characters");
-
-  defCmd("sed", function (args, stdin, sh) {
-    var o = opt(args, { bool: "n", arg: "e" });
-    var script = o.e || o._.shift();
-    var text = o._.length ? V.readFile(sh.path(o._[0])) : stdin;
-    var m = /^s(.)(.*?)\1(.*?)\1([gi]*)$/.exec(script || "");
-    if (!m) return { out: text, code: 0 };
-    var re = new RegExp(m[2], m[4].indexOf("g") >= 0 ? "g" : "");
-    var arr = text.split("\n"); if (arr[arr.length - 1] === "") arr.pop();
-    return { out: arr.map(function (l) { return l.replace(re, m[3]); }).join("\n") + "\n", code: 0 };
-  }, "sed - stream editor (s/// only)");
 
   defCmd("tac", function (args, stdin, sh) {
     var text = args.length ? V.readFile(sh.path(args[0])) : stdin;
@@ -2891,6 +2910,7 @@
     defCmd: defCmd, defBui: defBui, opt: opt,
     getopt: getopt, finish: finish, doc: doc,
     eachInput: eachInput, gnuErr: gnuErr, usage: usage,
+    brePattern: brePattern,
     sgr: sgr, human: human, CMDS: CMDS,
   };
 

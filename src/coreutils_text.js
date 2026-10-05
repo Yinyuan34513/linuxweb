@@ -122,11 +122,18 @@
       totals.bytes += r.bytes; totals.chars += r.chars;
       totals.maxlen = Math.max(totals.maxlen, r.maxlen);
     });
-    // Only the unfiltered, stdin-reading layout pads to seven columns; with
-    // operands (or a selection flag) the numbers share one computed width.
+    // Only the unfiltered, stdin-reading layout pads to seven columns.  With
+    // real operands the numbers share one width -- the number of digits in the
+    // largest byte count -- but a lone standard input has nothing to line up
+    // with, so it is not padded at all: `seq 1 5 | wc -l` is "5".
     var plain = keys.length === 3 && keys[0] === "lines";
-    var width = sawStdin && plain ? 7 : String(Math.max.apply(null,
-      rows.concat([totals]).map(function (r) { return r.bytes; }))).length;
+    var allStdin = rows.every(function (r) { return r.name === null || r.name === "-"; });
+    var width = 1;
+    if (sawStdin && plain) width = 7;
+    else if (!allStdin) {
+      width = String(Math.max.apply(null,
+        rows.concat([totals]).map(function (r) { return r.bytes; }))).length;
+    }
     var out = "";
 
     if (sawStdin && plain) {
@@ -1115,6 +1122,635 @@
       }).join(separator);
     }
   }, "relational database join");
+
+  // ---- sed -----------------------------------------------------------------
+  //
+  // A real stream editor: line addresses (N, N,M, $, /re/, $~N, first~step), the
+  // commands that actually get used (s///, p, d, q, =, a/i/c with a backslash,
+  // y///, n, N, h/H/g/G/x, b/t with labels, { }, :, ; and comments), and -n to
+  // stop printing what is not asked for.  Only the selected lines are printed,
+  // which is what makes `sed -n 9p` work.
+  def("sed", function (args, stdin, sh) {
+    // -e may be given more than once, so every one of them is picked out first
+    // and the rest goes through getopt
+    var expressions = [];
+    var rest = [];
+    for (var ai = 0; ai < args.length; ai++) {
+      var a = args[ai];
+      if (a === "-e" || a === "--expression") { expressions.push(args[++ai]); continue; }
+      if (a.slice(0, 2) === "--" && a.indexOf("=") > 3 &&
+          a.slice(2, a.indexOf("=")) === "expression") {
+        expressions.push(a.slice(a.indexOf("=") + 1));
+        continue;
+      }
+      if (a.slice(0, 2) === "-e" && a.length > 2) { expressions.push(a.slice(2)); continue; }
+      rest.push(a);
+    }
+
+    var g = getopt("sed", rest, {
+      short: { n: "bool", e: "arg", f: "arg", i: "bool", s: "bool", z: "bool", E: "bool", r: "bool", "0": "bool" },
+      long: { quiet: ["bool", "n"], silent: ["bool", "n"], expression: ["arg", "e"],
+              file: ["arg", "f"], inplace: ["bool", "i"], "in-place": ["bool", "i"],
+              separate: ["bool", "s"], "null-data": ["bool", "z"], "no-extended": ["bool", "r"],
+              posix: ["bool", "E"] },
+    });
+    var done = finish(sh, "sed", g);
+    if (done) return done;
+    var o = g.o;
+
+    var scripts = expressions.slice();
+    if (o.e !== undefined) scripts.push(String(o.e));
+    if (o.f !== undefined) {
+      var ftext = V.readFile(sh.path(String(o.f)));
+      if (ftext === null) {
+        sh._error("sed: can't read " + o.f + ": No such file or directory");
+        return { out: "", code: 2 };
+      }
+      scripts.push(ftext.replace(/\\n$/, ""));
+    }
+    if (g._.length && scripts.length === 0) scripts.push(g._.shift());
+    if (!scripts.length) {
+      for (var ui = 0; ui < sedUsage.length; ui++) sh._error(ui ? sedUsage[ui] : sedUsage[ui]);
+      return { out: "", code: 1 };
+    }
+    var program = scripts.join(";\n");
+    // -s treats the files separately; with one stream this only matters for
+    // $ (the last line of the input rather than of each file)
+    var separate = !!o.s;
+
+    var text = "", code = 0;
+    if (g._.length) {
+      var unreadable = eachInput("sed", g._, stdin, sh, function (prog, name, kind) {
+        return "sed: can't read " + name + ": " +
+          (kind === "dir" ? "Is a directory" : "No such file or directory");
+      }, function (t) { text += t; });
+      if (unreadable) code = 2;
+    } else text = stdin || "";
+
+    var lines = linesOf(text);
+    try {
+      var machine = new SedMachine(program, lines, sh);
+      machine.extended = !!(o.E || o.r);
+      var result = machine.run(o);
+      return { out: result.out, code: code || result.code };
+    } catch (err) {
+      if (err && err.sedVerb !== undefined) return { out: "", code: 2 };
+      throw err;
+    }
+  }, "GNU sed - stream editor");
+
+  var sedUsage = [
+    "Usage: sed [OPTION]... {script-only-if-no-other-script} [input-file]...",
+    "",
+    "  -n, --quiet, --silent",
+    "                 suppress automatic printing of pattern space",
+    "      --debug",
+    "                 annotate program execution",
+    "  -e script, --expression=script",
+    "                 add the script to the commands to be executed",
+    "  -f script-file, --file=script-file",
+    "                 add the contents of script-file to the commands to be executed",
+    "  --follow-symlinks",
+    "                 follow symlinks when processing in place",
+    "  -i[SUFFIX], --in-place[=SUFFIX]",
+    "                 edit files in place (makes backup if SUFFIX supplied)",
+    "  -l N, --line-length=N",
+    "                 specify the desired line-wrap length for the `l' command",
+    "  --posix",
+    "                 disable all GNU extensions.",
+    "  -E, -r, --regexp-extended",
+    "                 use extended regular expressions in the script",
+    "                 (for portability use POSIX -E).",
+    "  -s, --separate",
+    "                 consider files as separate rather than as a single,",
+    "                 continuous long stream.",
+    "      --sandbox",
+    "                 operate in sandbox mode (disable e/r/w commands).",
+    "  -u, --unbuffered",
+    "                 load minimal amounts of data from the input files and flush",
+    "                 the output buffers more often",
+    "  -z, --null-data",
+    "                 separate lines by NUL characters",
+    "      --help     display this help and exit",
+    "      --version  output version information and exit",
+    "",
+    "If no -e, --expression, -f, or --file option is given, then the first",
+    "non-option argument is taken as the sed script to interpret.  All",
+    "remaining arguments are names of input files; if no input files are",
+    "specified, then the standard input is read.",
+    "",
+    "GNU sed home page: <https://www.gnu.org/software/sed/>.",
+    "General help using GNU software: <https://www.gnu.org/gethelp/>.",
+  ];
+
+  // The line list, without the empty tail an ending newline leaves behind.
+  function linesOf(text) {
+    if (text === "") return [];
+    var a = text.split("\n");
+    if (a[a.length - 1] === "") a.pop();
+    return a;
+  }
+
+  // sed's own state machine, kept out of the command so the command stays a
+  // description of the interface.
+  function SedMachine(program, input, sh) {
+    this.in = input.slice();
+    this.sh = sh;
+    this.out = "";
+    this.spaces = "";                        // lines queued by a
+    this.pending = null;                     // the line queued by i or c
+    this.hold = "";
+    this.line = "";
+    this.lineNo = 0;
+    this.substituted = false;
+    this.suppress = false;
+    this.quit = false;
+    this.rangeState = [];                    // where each range is open, by command
+    this.broken = false;                    // an unknown command was reached
+    this.extended = false;                  // -E: the pattern is extended
+    this.cmds = parseSed(program, this.sh);
+  }
+
+  // ---- the program ----------------------------------------------------------
+  // Split into commands, each an address pair plus a verb, with the `p` after
+  // `s///` carried along.  Line numbers and $ are resolved at run time.
+  var KNOWN_VERBS = {};
+  "s y p d D q Q = a i c n N P h H g G x b t T : { } l r w R W z".split(" ")
+    .forEach(function (v) { KNOWN_VERBS[v] = true; });
+
+  function parseSed(program, sh) {
+    var cmds = [];
+    var unknown = null;
+    var i = 0, n = program.length;
+    function skipSpace() { while (i < n && /[\s;]/.test(program.charAt(i))) i++; }
+
+    function readAddress() {
+      skipSpace();
+      if (i >= n) return null;
+      var ch = program.charAt(i);
+      if (ch === "$") { i++; return { kind: "last" }; }
+      // no flags after an address: a letter there is the command, as in
+      // `/x/p`, and only an s/// command carries flags of its own
+      if (ch === "/") { i++; return { kind: "re", re: readUntil("/") }; }
+      if (ch === "\\") { i++; var c2 = program.charAt(i++); return readAddressFor(c2); }
+      var m = /^(\d+)/.exec(program.slice(i));
+      if (m) {
+        i += m[1].length;
+        var addr = { kind: "num", num: parseInt(m[1], 10) };
+        if (program.charAt(i) === "~") { i++; var step = /^(\d+)/.exec(program.slice(i)); addr.step = step ? (i += step[1].length, parseInt(step[1], 10)) : 1; addr.first = true; }
+        else if (program.charAt(i) === "+") { i++; var plus = /^(\d+)/.exec(program.slice(i)); addr.plus = plus ? (i += plus[1].length, parseInt(plus[1], 10)) : 1; }
+        return addr;
+      }
+      return null;
+    }
+    function readAddressFor(letter) {
+      switch (letter) {
+        case "n": { var m = /^(\d+)/.exec(program.slice(i)); if (m) { i += m[1].length; return { kind: "num", num: parseInt(m[1], 10) }; } return null; }
+        default: return null;
+      }
+    }
+    // Read up to an unescaped copy of `stop`, which may be any character:
+    // s/\(a\)/x/ delimits on "(" and not on a slash at all.
+    function readUntil(stop) {
+      var out = "";
+      while (i < n) {
+        var ch = program.charAt(i);
+        if (ch === "\\" && program.charAt(i + 1) === stop) { out += stop; i += 2; continue; }
+        if (ch === "\\" && program.charAt(i + 1) === "\\") { out += "\\\\"; i += 2; continue; }
+        if (ch === stop) break;
+        if (ch === "\n" && stop !== "\n") break;
+        out += ch;
+        i++;
+      }
+      if (i < n && program.charAt(i) === stop) i++;      // the closing delimiter
+      return out;
+    }
+    // s/// may be followed by flags: g for every match, i to ignore case, p to
+    // print as well, q to stop
+    function skipRegexFlags() {
+      while (i < n && /[gpiqIW]/.test(program.charAt(i))) i++;
+    }
+
+    while (true) {
+      skipSpace();
+      if (i >= n) break;
+      if (program.charAt(i) === "#") { while (i < n && program.charAt(i) !== "\n") i++; continue; }
+      var start = i;
+      var a1 = readAddress();
+      skipSpace();
+      var a2 = null;
+      if (program.charAt(i) === ",") {
+        i++;
+        skipSpace();
+        var rel = program.charAt(i);
+        if (rel === "+" || rel === "~") {
+          i++;
+          var m2 = /^(\d+)/.exec(program.slice(i));
+          var amount = m2 ? (i += m2[1].length, parseInt(m2[1], 10)) : 1;
+          a2 = rel === "+" ? { kind: "plus", num: amount } : { kind: "every", num: amount };
+        } else {
+          a2 = readAddress();
+        }
+        skipSpace();
+      }
+      var negate = false;
+      if (program.charAt(i) === "!") { negate = true; i++; skipSpace(); }
+      var ch = program.charAt(i);
+      if (!ch) { unknown = " "; break; }
+      if (ch === "{") {
+        i++;
+        var body = [];
+        var depth = 1;
+        while (i < n && depth > 0) {
+          if (program.charAt(i) === "{") depth++;
+          else if (program.charAt(i) === "}") { depth--; if (depth === 0) { i++; break; } }
+          else if (program.charAt(i) === ";") { i++; continue; }
+          else if (program.charAt(i) === "#") { while (i < n && program.charAt(i) !== "\n") i++; continue; }
+          body.push(program.charAt(i));
+          i++;
+        }
+        cmds.push({ addr1: a1, addr2: a2, negate: negate, verb: "{",
+          body: body.join(""), at: start });
+        continue;
+      }
+      var cmd = { addr1: a1, addr2: a2, negate: negate, at: start };
+      switch (ch) {
+        case "s": case "y": {
+          var kind = ch;
+          i++;
+          var delim = program.charAt(i++);
+          var re = readUntil(delim);
+          var rep = readUntil(delim);
+          var flags = "";
+          if (kind === "s") { while (i < n && /[gipqIW0-9eM]/.test(program.charAt(i))) flags += program.charAt(i++); }
+          cmd.verb = kind;
+          cmd.delim = delim;
+          cmd.re = re;
+          cmd.rep = rep;
+          cmd.flags = flags;
+          break;
+        }
+        case "a": case "i": case "c": {
+          i++;
+          // GNU sed takes the text on the same line after a backslash, or on
+          // the following lines; whatever follows the backslash is the text,
+          // spaces and all
+          var textOut = "";
+          if (program.charAt(i) === "\\") i++;
+          while (i < n && program.charAt(i) !== "\n" && program.charAt(i) !== ";") { textOut += program.charAt(i++); }
+          while (i < n && program.charAt(i) !== ";") {
+            if (program.charAt(i) === "\\" && program.charAt(i + 1) === "\n") { i += 2; textOut += "\n"; continue; }
+            if (program.charAt(i) === "\n") { i++; textOut += "\n"; continue; }
+            textOut += program.charAt(i++);
+          }
+          cmd.verb = ch;
+          cmd.text = textOut.replace(/\\n/g, "\n").replace(/\\\\/g, "\\");
+          break;
+        }
+        case "w": case "r": case "W": case "R": {
+          i++;
+          var fname = "";
+          while (i < n && program.charAt(i) !== "\n" && program.charAt(i) !== ";") {
+            fname += program.charAt(i++);
+          }
+          cmd.verb = ch;
+          cmd.file = fname.trim();
+          break;
+        }
+        case "b": case "t": case "T": case ":": {
+          i++;
+          while (i < n && /[ \t]/.test(program.charAt(i))) i++;
+          var label = "";
+          while (i < n && /[A-Za-z0-9_]/.test(program.charAt(i))) label += program.charAt(i++);
+          cmd.verb = ch;
+          cmd.label = label;
+          break;
+        }
+        case "P": case "D": case "N": case "s":
+          i++;
+          cmd.verb = ch;
+          break;
+        default:
+          i++;
+          cmd.verb = ch;
+          while (i < n && /[ \t]/.test(program.charAt(i))) i++;
+          if (!KNOWN_VERBS[cmd.verb]) unknown = cmd.verb;
+      }
+      cmds.push(cmd);
+      if (program.charAt(i) === ";") i++;
+    }
+    if (unknown) {
+      // sed reads the whole program before it runs any of it, so a command it
+      // does not know stops it even if an earlier one would have quit
+      var err = new Error("unknown command");
+      err.sedVerb = unknown;
+      err.sedAt = i;
+      throw err;
+    }
+    return cmds;
+  }
+
+  // ---- running it -----------------------------------------------------------
+  SedMachine.prototype.run = function (o) {
+    var quiet = !!o.n;
+
+    for (var idx = 0; idx < this.in.length && !this.quit; idx++) {
+      this.line = this.in[idx];
+      this.lineNo = idx + 1;
+      this.substituted = false;
+      this.startedAt = 0;
+      if (this.spaces.length) { this.print(this.spaces); this.spaces = ""; }
+      var c = 0;                             // the program starts again each line
+
+      while (c < this.cmds.length) {
+        var cmd = this.cmds[c];
+        c++;
+        if (this.matches(cmd, idx, c - 1) === !!cmd.negate) continue;
+        var next = this.execute(cmd, idx, quiet);
+        if (next === "quit") { c = this.cmds.length; break; }
+        if (next && next.indexOf("jump:") === 0) {
+          var at = this.findLabel(next.slice(5));
+          c = at >= 0 ? at : this.cmds.length;
+          break;
+        }
+        // n and N consume the following line, which the outer loop must not
+        // print again
+        if (next === "next-line") { idx++; c = 0; break; }
+        if (next === "restart") { c = 0; break; }
+        if (this.quit) { c = this.cmds.length; break; }
+      }
+      if (this.quit) break;
+      if (this.pending) { this.print(this.pending); this.pending = null; }
+      if (!quiet && !this.suppress) this.print(this.line);
+      if (this.suppress) this.suppress = false;
+      if (this.spaces.length) { this.print(this.spaces); this.spaces = ""; }
+    }
+    if (this.out.length && !/\n$/.test(this.out)) this.out += "\n";
+    return { out: this.out, code: this.broken ? 2 : 0 };
+  };
+
+  SedMachine.prototype.print = function (text) {
+    this.out += /\n$/.test(text) ? text : text + "\n";
+  };
+
+  // Which lines a command applies to: N, N,M, $, /re/, first~step, N+N, and a
+  // second address that is relative.  A *range* is not a test per line: it opens
+  // where the first address matches and stays open until the second one matches,
+  // which is why the state lives on the machine between lines.
+  SedMachine.prototype.matches = function (cmd, idx, ci) {
+    var self = this;
+    function single(addr) {
+      if (!addr) return false;
+      if (addr.kind === "num") return self.lineNo === addr.num;
+      if (addr.kind === "last") return self.lineNo === self.in.length;
+      if (addr.kind === "plus") return self.lineNo <= self.openedAt + addr.num;
+      if (addr.kind === "every") return (self.lineNo - self.openedAt) % addr.num === 0;
+      if (addr.kind === "re") return sedRegExp(addr.re, "", self.extended).test(self.line);
+      return false;
+    }
+    if (!cmd.addr1 && !cmd.addr2) return true;
+
+    if (cmd.addr1 && cmd.addr2) {
+      if (this.rangeState[ci]) {
+        var openedAt = this.rangeState[ci];
+        if (cmd.addr2.kind === "re") {
+          // the closing pattern is searched for from the line the range opened
+          // on, so the range may span lines that do not match it
+          var target = 0;
+          for (var j = openedAt - 1; j < self.in.length; j++) {
+            if (sedRegExp(cmd.addr2.re, "", self.extended).test(self.in[j])) { target = j + 1; break; }
+          }
+          if (!target) return true;                 // never closes: to the end
+          if (self.lineNo <= target) return true;   // still inside the range
+          this.rangeState[ci] = 0;
+          return false;                              // and past its end
+        }
+        var closes = cmd.addr2.kind === "last"
+          ? self.lineNo === self.in.length
+          : self.lineNo >= cmd.addr2.num;
+        if (closes) this.rangeState[ci] = 0;
+        return true;
+      }
+      if (!single(cmd.addr1)) return false;
+      this.rangeState[ci] = self.lineNo;
+      this.openedAt = self.lineNo;
+      // a range that closes on its own first line is over immediately
+      if (cmd.addr2.kind === "re") {
+        if (sedRegExp(cmd.addr2.re, "", self.extended).test(self.line)) this.rangeState[ci] = 0;
+      } else if (cmd.addr2.kind === "last") {
+        if (self.lineNo === self.in.length) this.rangeState[ci] = 0;
+      } else if (cmd.addr2.num <= self.lineNo) {
+        this.rangeState[ci] = 0;
+      }
+      return true;
+    }
+
+    if (cmd.addr1 && !cmd.addr2) {
+      if (cmd.addr1.first) {
+        // first~step: this line and every step-th one after it
+        if (self.lineNo < cmd.addr1.num) return false;
+        return (self.lineNo - cmd.addr1.num) % (cmd.addr1.step || 1) === 0;
+      }
+      if (cmd.addr1.plus !== undefined) {
+        return self.lineNo >= cmd.addr1.num && self.lineNo < cmd.addr1.num + cmd.addr1.plus;
+      }
+      return single(cmd.addr1);
+    }
+    return single(cmd.addr2);
+  };
+
+  SedMachine.prototype.execute = function (cmd, idx, quiet) {
+    var line = this.line;
+    switch (cmd.verb) {
+      case "s": {
+        var flags = cmd.flags || "";
+        var re = sedRegExp(cmd.re, (flags.indexOf("g") >= 0 ? "g" : "") +
+          (flags.indexOf("i") >= 0 || flags.indexOf("I") >= 0 ? "i" : ""), this.extended);
+        if (!re.test(line)) return "";
+        if (flags.indexOf("p") >= 0) this.print(substitute(line, cmd, flags, this.extended));
+        this.line = substitute(line, cmd, flags, this.extended);
+        this.substituted = true;
+        if (flags.indexOf("q") >= 0) this.quit = true;
+        if (flags.indexOf("Q") >= 0) { this.quit = true; this.suppress = true; }
+        return "";
+      }
+      case "y": {
+        var from = cmd.re.split(""), to = cmd.rep.split("");
+        var out = "";
+        for (var i = 0; i < line.length; i++) {
+          var at = from.indexOf(line.charAt(i));
+          out += at >= 0 && at < to.length ? to[at] : line.charAt(i);
+        }
+        this.line = out;
+        return "";
+      }
+      case "p": this.print(this.line); return "";
+      case "d": this.suppress = true; return "";
+      case "D": {
+        var nl = this.line.indexOf("\n");
+        if (nl < 0) { this.suppress = true; return ""; }
+        this.line = this.line.slice(nl + 1);
+        return "restart";
+      }
+      case "q": if (!quiet) this.print(this.line); this.suppress = true; this.quit = true; return "";
+      case "Q": this.quit = true; this.suppress = true; return "";
+      case "=": this.print(String(this.lineNo)); return "";
+      case "a": this.spaces += cmd.text + "\n"; return "";
+      case "i": this.pending = cmd.text; return "";
+      case "c": this.pending = cmd.text; this.suppress = true; return "";
+      case "n": {
+        if (idx + 1 < this.in.length) {
+          this.line = this.in[idx + 1];
+          this.lineNo = idx + 2;
+          this.in.splice(idx + 1, 1);
+          return "next-line";
+        }
+        this.suppress = true;
+        return "";
+      }
+      case "N": {
+        // with no line left to append there is nothing to do, and GNU sed stops
+        if (idx + 1 < this.in.length) {
+          this.line = this.line + "\n" + this.in[idx + 1];
+          this.in.splice(idx + 1, 1);
+        }
+        return "";
+      }
+      case "P": {
+        var cut = this.line.indexOf("\n");
+        if (cut >= 0) this.print(this.line.slice(0, cut));
+        return "";
+      }
+      case "h": this.hold = this.line; return "";
+      case "H": this.hold += "\n" + this.line; return "";
+      case "g": this.line = this.hold; return "";
+      case "G": this.line = this.hold + "\n" + this.line; return "";
+      case "x": { var t = this.line; this.line = this.hold; this.hold = t; return ""; }
+      case "b": return this.findLabel(cmd.label) >= 0 ? "jump:" + cmd.label : "";
+      case "t": {
+        if (!this.substituted) return "";
+        this.substituted = false;
+        return this.findLabel(cmd.label) >= 0 ? "jump:" + cmd.label : "";
+      }
+      case "T": return this.substituted ? "" : (this.findLabel(cmd.label) >= 0 ? "jump:" + cmd.label : "");
+      case ":": return "";
+      case "{": {
+        // a block is a program of its own, run over the line as it stands
+        var inner = new SedMachine(cmd.body, [this.line], this.sh);
+        inner.extended = this.extended;
+        inner.lineNo = this.lineNo;
+        inner.hold = this.hold;
+        var res = inner.run({ n: true });
+        this.line = inner.in[0] === undefined ? this.line : inner.in[0];
+        this.hold = inner.hold;
+        this.out += res.out;
+        this.pending = (inner.pending || this.pending);
+        if (this.pending) this.pending += "\n";
+        this.spaces += inner.spaces;
+        if (inner.substituted) this.substituted = true;
+        if (inner.quit) this.quit = true;
+        return "";
+      }
+      case "}": return "";
+      case "l": this.print(this.line + "$"); return "";
+      // w and r would write and read files; the console has no use for either
+      // from a one-line filter, so they are accepted and ignored
+      case "r": case "w": case "R": case "W": case "z": case "#": return "";
+      default:
+        // sed rejects a command it does not know, and says nothing
+        this.broken = true;
+        return "";
+    }
+  };
+
+  // POSIX classes, spelled the way sed scripts spell them
+  var POSIX_CLASS = {
+    alpha: "A-Za-z", digit: "0-9", alnum: "A-Za-z0-9", upper: "A-Z", lower: "a-z",
+    space: " \\t\\r\\n\\v\\f", blank: " \\t", punct: "!-\\/:-@\\[-`{-~",
+    print: " -~", graph: "!-~", cntrl: "\\x00-\\x1f\\x7f", xdigit: "0-9A-Fa-f",
+    word: "A-Za-z0-9_",
+  };
+  // A sed pattern is not a JavaScript one: a basic regular expression spells a
+  // group \( \) and an alternation \|, and neither means anything to RegExp.
+  // The escapes for literal characters are the same in both.
+  function sedPattern(source, extended) {
+    var out = "", i = 0, depth = 0;
+    var plain = { "{": "}", "|": "|", "+": "+", "?": "?" };
+    while (i < source.length) {
+      var ch = source.charAt(i);
+      if (ch !== "\\") { out += ch; i++; continue; }
+      var next = source.charAt(i + 1);
+      if (next === "\\") { out += "\\\\"; i += 2; continue; }
+      if (extended) {
+        // in an extended pattern the punctuation stands for itself, so only the
+        // group escapes need changing
+        out += (next === "(" || next === ")") ? next : "\\" + next;
+        i += 2;
+        continue;
+      }
+      // A basic regular expression spells a group \( ... \), and puts a
+      // backslash in front of the punctuation operators: \| for alternation,
+      // \+ for one or more, \? for optional, \{n,m\} for a count.
+      if (next === "(" || next === ")") { out += next; i += 2; continue; }
+      out += Object.prototype.hasOwnProperty.call(plain, next) ? next : "\\" + next;
+      i += 2;
+    }
+    return out;
+  }
+
+  function sedRegExp(source, flags, extended) {
+    return new RegExp(expandPosix(sedPattern(source, extended)), flags);
+  }
+  function expandPosix(source) {
+    // A POSIX class is written [:name:] between the brackets of the class it
+    // belongs to: [[:alpha:]] is one "a to z or A to Z".
+    return String(source).replace(/\[:([a-z]+):\]/g, function (_, name) {
+      // only the contents are replaced: the brackets around them belong to the
+      // character class the script already wrote
+      var set = POSIX_CLASS[name];
+      return set === undefined ? _ : set;
+    });
+  }
+
+  // The replacement: \1..\9 are the groups, & is the whole match, \n and \t are
+  // written in the script.
+  function substitute(line, cmd, flags, extended) {
+    var re = sedRegExp(cmd.re, (flags.indexOf("g") >= 0 ? "g" : "") +
+      (flags.indexOf("i") >= 0 || flags.indexOf("I") >= 0 ? "i" : ""), extended);
+    // A global substitution skips an empty match that begins exactly where the
+    // previous one ended: that is why `sed 's/a*/X/g'` turns "aaa" into "X"
+    // but "bbb" into "XbXbXbX".
+    var global = flags.indexOf("g") >= 0;
+    var scan = new RegExp(re.source, "g");
+    var out = "", at = 0, lastEnd = -1, m;
+    while ((m = scan.exec(line)) !== null) {
+      if (m[0] === "" && m.index === lastEnd) { scan.lastIndex++; continue; }
+      out += line.slice(at, m.index) + replacement(m, cmd.rep);
+      at = m.index + m[0].length;
+      lastEnd = at;
+      if (m[0] === "") scan.lastIndex++;
+      if (!global) break;
+    }
+    return out + line.slice(at);
+
+    // m is the whole match array, so m[0] is the match and m[1].. its groups
+    function replacement(m, rep) {
+      return rep.replace(/\\([0-9&])|&|\\n|\\t/g, function (tok, d) {
+        if (tok === "&") return m[0];
+        if (tok === "\\n") return "\n";
+        if (tok === "\\t") return "\t";
+        if (d === "&") return "&";             // \& is an ampersand
+        return m[parseInt(d, 10)] === undefined ? "" : m[parseInt(d, 10)];
+      });
+    }
+  }
+
+  SedMachine.prototype.findLabel = function (label) {
+    for (var i = 0; i < this.cmds.length; i++) {
+      if (this.cmds[i].verb === ":" && this.cmds[i].label === label) return i;
+    }
+    return -1;
+  };
 
   // ---- comm ----------------------------------------------------------------
   //

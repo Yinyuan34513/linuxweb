@@ -10,7 +10,10 @@ Term.prototype.clear = function () { this.text = ""; };
 const ctx = { console, setTimeout, clearTimeout, setInterval, clearInterval, Date, atob, window: {} };
 vm.createContext(ctx);
 const dir = path.join(__dirname, "..");
-for (const f of ["src/bash.data.js", "src/help.js", "src/vfs.js", "src/bash.js"]) {
+for (const f of ["src/bash.data.js", "src/help.js", "src/vfs.js", "src/bash.js",
+                 "src/coreutils_help.js", "src/coreutils_text.js",
+                 "src/coreutils_file.js", "src/coreutils_sys.js",
+                 "src/coreutils_digest.js"]) {
   vm.runInContext(fs.readFileSync(path.join(dir, f), "utf8"), ctx, { filename: f });
 }
 const LW = ctx.window.LW;
@@ -40,7 +43,7 @@ check("status err", "false; echo $?", "1\n");
 check("subst", "echo $(uname -s)", "Linux\n");
 check("andor", "true && echo yes", "yes\n");
 check("andor2", "false || echo fallback", "fallback\n");
-check("seq/pipe", "seq 1 5 | wc -l", "      5\n");
+check("seq/pipe", "seq 1 5 | wc -l", "5\n");
 
 console.log("--- coreutils ---");
 check("pwd", "pwd", "/home/linuxweb\n");
@@ -55,7 +58,7 @@ check("tr", "echo abc | tr a-z A-Z", "ABC\n");
 check("sort", "printf 'b\\na\\nc\\n' | sort", "a\nb\nc\n");
 check("uniq", "printf 'a\\na\\nb\\n' | uniq", "a\nb\n");
 check("sed", "echo hello | sed s/l/L/g", "heLLo\n");
-check("wc", "printf 'a b c\\n' | wc -w", "      3\n");
+check("wc", "printf 'a b c\\n' | wc -w", "3\n");
 check("glob", "echo /etc/host*", "/etc/hostname /etc/hosts\n");
 check("ls", "ls /etc", (o) => o.includes("os-release") && o.includes("hostname"));
 check("uname", "uname -s", "Linux\n");
@@ -66,7 +69,7 @@ console.log("--- redirection (goes through the VFS) ---");
 check("write", "echo hello > /tmp/x; cat /tmp/x", "hello\n");
 check("append", "echo world >> /tmp/x; cat /tmp/x", "hello\nworld\n");
 check("pipe file", "cat /tmp/x | tr a-z A-Z", "HELLO\nWORLD\n");
-check("read redirect", "wc -l < /tmp/x", "      2\n");
+check("read redirect", "wc -l < /tmp/x", "2\n");
 
 console.log("--- control flow ---");
 check("for", "for i in a b c; do echo $i; done", "a\nb\nc\n");
@@ -106,7 +109,7 @@ check("help unknown topic (merged, real wording)", "help nosuchtopic 2>&1",
 check("set -o first line", "set -o | head -1", "allexport      \toff\n");
 check("set -o emacs", "set -o | grep --color=never emacs", "emacs          \ton\n");
 check("set +o first line", "set +o | head -1", "set +o allexport\n");
-check("bind -P line count (leading blank included)", "bind -P | wc -l", "    174\n");
+check("bind -P line count (leading blank included)", "bind -P | wc -l", "174\n");
 check("bind -P abort line", "bind -P | grep --color=never '^abort '", 'abort can be found on "\\C-g", "\\C-x\\C-g", "\\M-\\C-g".\n');
 
 console.log("--- functions ---");
@@ -119,11 +122,11 @@ check("type builtin", "type echo", "echo is a shell builtin\n");
 check("which finds builtins", "which echo", "/usr/bin/echo\n");
 
 console.log("--- help listing: bash's complete list ---");
-check("listing row count (8 header + 38)", "help | wc -l", "     46\n");
-check("first cell is job_spec", "help | sed -n '9p' | cut -c1-13", " job_spec [&");
-check("right column top is history", "help | head -n 9 | tail -n 1 | cut -c41-47", "history");
-check("left column bottom is help", "help | tail -1 | cut -c1-5", " help");
-check("right column bottom is { COMMANDS ; }", "help | tail -1 | cut -c41-54", "{ COMMANDS ; }");
+check("listing row count (8 header + 38)", "help | wc -l", "46\n");
+check("first cell is job_spec", "help | sed -n '9p' | cut -c1-13", " job_spec [&]\n");
+check("right column top is history", "help | head -n 9 | tail -n 1 | cut -c41-47", " histor\n");
+check("left column bottom is help", "help | tail -1 | cut -c1-5", " help\n");
+check("right column bottom is { COMMANDS ; }", "help | tail -1 | cut -c41-54", " { COMMANDS ; \n");
 check("includes mapfile", "help | grep --color=never -c mapfile", "1\n");
 check("includes coproc", "help | grep --color=never -c coproc", "1\n");
 check("includes for ((", "help | grep --color=never -c 'for (('", "1\n");
