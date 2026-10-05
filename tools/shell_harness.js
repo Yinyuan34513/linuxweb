@@ -35,11 +35,14 @@ const DEFAULT_FILES = [
   "src/devtmpfs.js",
   "src/apt.js",
   "src/bash.js",
+  "src/systemd.js",
   "src/coreutils_help.js",
   "src/coreutils_text.js",
   "src/coreutils_file.js",
   "src/coreutils_sys.js",
   "src/coreutils_digest.js",
+  "assets/libmagic.js",     // file(1)'s libmagic, compiled to wasm
+  "src/magicmgc.data.js",
   "src/magic.js",
   "src/getty.js",
 ];
@@ -51,6 +54,7 @@ function loadShell(files, opts) {
   const dir = opts.root || path.join(__dirname, "..");
   const list = files || DEFAULT_FILES;
   const ctx = {
+    __dirname: dir,
     console: opts.quiet ? { log: function () {}, warn: function () {}, error: console.error } : console,
     setTimeout, clearTimeout, setInterval, clearInterval,
     Date, Math, JSON, atob, btoa,
