@@ -30,13 +30,18 @@ Term.prototype.resize = function () {};
 const DEFAULT_FILES = [
   "src/bash.data.js",
   "src/help.js",
+  "src/sha256.js",
   "src/vfs.js",
-  "src/coreutils_help.js",
+  "src/devtmpfs.js",
+  "src/apt.js",
   "src/bash.js",
+  "src/coreutils_help.js",
   "src/coreutils_text.js",
   "src/coreutils_file.js",
   "src/coreutils_sys.js",
   "src/coreutils_digest.js",
+  "src/magic.js",
+  "src/getty.js",
 ];
 
 // Load the shell and return a handle.  `files` overrides the script list; pass

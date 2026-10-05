@@ -32,6 +32,17 @@
     return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
   };
 
+  // The machine's idea of "now", as a Date in UTC -- the console's boot log,
+  // the login line and every date command read this one clock, so they cannot
+  // disagree.  (The whole system is set up as UTC: /etc/localtime, the kernel
+  // banner and the getty line all say so.)
+  var bootTime = new Date();
+  LW.now = function () { return new Date(); };
+  LW.bootTime = function () { return bootTime; };
+  LW.uptime = function () { return (Date.now() - bootTime.getTime()) / 1000; };
+  LW.TZ = "UTC";
+  LW.TZ_OFFSET_MINUTES = 0;
+
   // Scale the 640x400 canvas by the largest integer factor that fits.
   function fit() {
     var s = Math.max(1, Math.min(

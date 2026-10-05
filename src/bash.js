@@ -395,6 +395,40 @@
   var BUI = {};
   function defBui(name, fn) { BUI[name] = { run: fn }; }
 
+  // --help and --version come from the captured text (src/coreutils_help.js),
+  // and a long option nobody knows is an error rather than a file name.  ls
+  // predates getopt() here, so it needs the check spelled out.
+  var LS_LONGS = ["all", "almost-all", "author", "block-size", "color", "directory",
+    "dereference", "escape", "format", "full-time", "group-directories-first",
+    "human-readable", "ignore", "indicator-style", "inode", "literal",
+    "modification-time", "no-group", "numeric-owner", "omit-header", "output",
+    "quote-style", "recursive", "reverse", "size", "sort", "time", "time-style",
+    "width"];
+
+  function longOptGuard(prog, args) {
+    for (var i = 0; i < args.length; i++) {
+      var a = args[i];
+      if (a === "--") return null;                       // operands follow
+      if (a.slice(0, 2) !== "--" || a.length < 3) continue;
+      var eq = a.indexOf("=");
+      var name = eq < 0 ? a.slice(2) : a.slice(2, eq);
+      if (name === "help") return { out: doc(prog, "help"), code: 0 };
+      if (name === "version") return { out: doc(prog, "version"), code: 0 };
+      if (prog === "ls" && LS_LONGS.indexOf(name) < 0) {
+        return { err: prog + ": unrecognized option '" + (eq < 0 ? a : a.slice(0, eq)) + "'" };
+      }
+      if (LS_LONGS.indexOf(name) >= 0 && eq < 0 &&
+          ["block-size", "color", "format", "ignore", "indicator-style", "output",
+           "quote-style", "sort", "time-style", "width"].indexOf(name) >= 0) {
+        // these take a separate argument; swallow it so it is not an operand
+        args.splice(i + 1, 0, "");
+        args.splice(i + 1, 1);
+        args[i] = a;                                   // keep the option itself
+      }
+    }
+    return null;
+  }
+
   function opt(args, spec) {
     var o = { _: [] }, i = 0;
     spec = spec || {};
@@ -564,6 +598,15 @@
 
   // ---- ls
   defCmd("ls", function (args, stdin, sh) {
+    var early = longOptGuard("ls", args);
+    if (early) {
+      if (early.err) {
+        sh._error(early.err);
+        sh._error("Try 'ls --help' for more information.");
+        return { out: "", code: 1 };
+      }
+      return early;
+    }
     var o = opt(args, { bool: "laFh1Rr", long: ["all", "long", "color", "human-readable", "reverse"], argLong: ["color"] });
     var color = !!o.color;
     if (o.color === "never") color = false;
@@ -628,6 +671,37 @@
     }
     return { out: res, code: 0 };
   }, "ls - list directory contents");
+
+  // dir(1) and vdir(1) are ls with a fixed layout: dir always prints the
+  // multi-column form and vdir always the long one.  They keep their own
+  // names for --help, which is why they are not aliases.
+  defCmd("dir", function (args, stdin, sh) {
+    var early = longOptGuard("dir", args);
+    if (early) {
+      if (early.err) {
+        sh._error(early.err);
+        sh._error("Try 'dir --help' for more information.");
+        return { out: "", code: 1 };
+      }
+      return early;
+    }
+    return CMDS.ls.run(args.filter(function (a) { return a !== "-1"; }), stdin, sh);
+  }, "dir - list directory contents");
+
+  defCmd("vdir", function (args, stdin, sh) {
+    var early = longOptGuard("vdir", args);
+    if (early) {
+      if (early.err) {
+        sh._error(early.err);
+        sh._error("Try 'vdir --help' for more information.");
+        return { out: "", code: 1 };
+      }
+      return early;
+    }
+    // vdir is `ls -l`, unless the caller asked for something else
+    if (!args.some(function (a) { return /^-[a-zA-Z]/.test(a); })) args = ["-l"].concat(args);
+    return CMDS.ls.run(args, stdin, sh);
+  }, "vdir - list directory contents");
 
   // ---- cat
   //

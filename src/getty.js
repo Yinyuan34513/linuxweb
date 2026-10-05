@@ -71,6 +71,50 @@
     return LW.checkPassword(field, pass);
   }
 
+  // login(1) prints the *previous* successful login, in its own format:
+  //   Last login: Sat Oct  3 09:13:58 UTC 2026 on tty1
+  // with the day of the month padded to two columns.  The time is generated
+  // when the login happens and the record kept in /var/log/lastlogin, so the
+  // line is always real rather than a fixed string.
+  var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  var DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  var LASTLOGIN = "/var/log/lastlogin";
+
+  function now() {
+    // LW.now() is the one clock the whole console reads, so the login line and
+    // the boot log cannot disagree
+    return LW.now ? LW.now() : new Date();
+  }
+
+  // The fields are read as UTC because the machine is set up in UTC --
+  // /etc/localtime, the kernel banner and the boot log all say so -- and the
+  // line has to agree with them whatever timezone the browser happens to be in.
+  function loginStamp(d) {
+    function two(n) { return (n < 10 ? "0" : "") + n; }
+    return DAYS[d.getUTCDay()] + " " + MONTHS[d.getUTCMonth()] + " " +
+      String(d.getUTCDate()).padStart(2, " ") + " " +
+      two(d.getUTCHours()) + ":" + two(d.getUTCMinutes()) + ":" + two(d.getUTCSeconds()) +
+      " UTC " + d.getUTCFullYear();
+  }
+
+  function recordLogin(stamp, tty) {
+    // ISO time and tty, one line; login(1)'s own file is binary, but keeping
+    // it text means it survives the VFS save/restore like everything else
+    try {
+      V.writeFile(LASTLOGIN, stamp.getTime() + " " + tty + "\n", false);
+    } catch (e) { /* the filesystem may be read-only; the line still shows */ }
+  }
+
+  function previousLogin() {
+    var raw = V.readFile(LASTLOGIN);
+    if (!raw) return null;
+    var parts = raw.trim().split(/\s+/);
+    var when = new Date(parseInt(parts[0], 10));
+    if (isNaN(when.getTime())) return null;
+    return { when: when, tty: parts[1] || "tty1" };
+  }
+
   function Getty(term, onShell) {
     this.term = term;
     this.onShell = onShell;
@@ -150,7 +194,13 @@
 
   Getty.prototype.success = function () {
     var t = this.term;
-    t.write("Last login: Sat Oct  3 09:13:58 UTC 2026 on tty1\n");
+    var ttyName = "tty" + (t.vt || 1);
+    var prev = previousLogin();
+    // With no record yet there is nothing to report, but showing the time of
+    // this boot reads better than nothing on a fresh filesystem.
+    var when = prev ? prev.when : LW.bootTime ? LW.bootTime() : now();
+    t.write("Last login: " + loginStamp(when) + " on " + (prev ? prev.tty : ttyName) + "\n");
+    recordLogin(now(), ttyName);
     var motd = V.readFile("/etc/motd");
     if (motd) t.write(motd);
     t.write("\n");
