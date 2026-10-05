@@ -90,18 +90,27 @@
   Lexer.prototype.run = function () {
     var out = [];
     for (;;) {
-      this.ws();
+      var before = this.ws();                  // did whitespace separate it?
       if (this.i >= this.s.length) break;
       if (this.s.charAt(this.i) === "#") break;      // comment to end of line
       var op = this.opAt();
-      if (op) { this.i += op.length; out.push({ op: op }); continue; }
-      out.push(this.word());
+      if (op) {
+        this.i += op.length;
+        var t = { op: op, spaced: before };
+        out.push(t);
+        continue;
+      }
+      var w = this.word();
+      w.spaced = before;
+      out.push(w);
     }
     return out;
   };
 
   Lexer.prototype.ws = function () {
-    while (this.i < this.s.length && " \t".indexOf(this.s.charAt(this.i)) >= 0) this.i++;
+    var seen = false;
+    while (this.i < this.s.length && " \t".indexOf(this.s.charAt(this.i)) >= 0) { this.i++; seen = true; }
+    return seen;
   };
 
   Lexer.prototype.opAt = function () {
@@ -305,22 +314,32 @@
     for (;;) {
       var x = this.peek();
       if (!x) break;
-      if (x.op === ">" || x.op === ">>" || x.op === "<") {
+      // A number glued to a redirection is that file descriptor: `cmd 2> log`
+      // and `cmd 2>/dev/null`.  A space before the operator leaves it an
+      // ordinary operand instead -- `seq 3 > f` prints 1 2 3, as bash does.
+      var nx = this.t[this.i + 1];
+      if (x.op !== "<" && x.raw && /^[0-9]+$/.test(x.raw) && nx && !nx.spaced &&
+          (nx.op === ">" || nx.op === ">>")) {
+        var fd = parseInt(x.raw, 10);
         this.next();
+        var op = this.next();                          // the operator itself
         var dup = false;
-        if (x.op !== "<" && this.op("&")) { this.next(); dup = true; }  // N>&M
+        if (this.op("&")) { this.next(); dup = true; } // N>&M
         var w = this.peek();
         var tgt = (w && !w.op && !w.empty) ? this.next() : { segs: [{ lit: "" }], raw: "", empty: true };
-        redirs.push({ op: dup ? ">&" : x.op, target: tgt, dup: dup });
+        redirs.push({ op: dup ? ">&" : op.op, target: tgt, dup: dup, fd: fd });
+        continue;
+      }
+      if (x.op === ">" || x.op === ">>" || x.op === "<") {
+        this.next();
+        var dup2 = false;
+        if (x.op !== "<" && this.op("&")) { this.next(); dup2 = true; }  // N>&M
+        var w2 = this.peek();
+        var tgt2 = (w2 && !w2.op && !w2.empty) ? this.next() : { segs: [{ lit: "" }], raw: "", empty: true };
+        redirs.push({ op: dup2 ? ">&" : x.op, target: tgt2, dup: dup2, fd: 1 });
         continue;
       }
       if (x.op) break;
-      // a bare number immediately before a redirect is an fd prefix, e.g. 2>
-      var nx = this.t[this.i + 1];
-      if (x.raw && /^[0-9]+$/.test(x.raw) && nx && (nx.op === ">" || nx.op === ">>" || nx.op === "<")) {
-        this.next();
-        continue;
-      }
       if (!x.empty) words.push(x);
       this.next();
     }
@@ -473,6 +492,15 @@
         if (spec.helpShort && c === spec.helpShort) return doneWith("help");
         if (spec.versionShort && c === spec.versionShort) return doneWith("version");
         var se = Object.prototype.hasOwnProperty.call(shortSpec, c) ? shortSpec[c] : null;
+        // POSIX lets head, tail and pr write `-3` for "-n 3"; a spec says so
+        // with `digits: "n"`, which is where the number is filed.  The whole
+        // run of digits is the value, so `-40` is forty and not four.
+        if (se === null && spec.digits && /^[0-9]$/.test(c)) {
+          var run = /^[0-9]+/.exec(chars.slice(k))[0];
+          o[spec.digits] = run;
+          k += run.length - 1;
+          continue;
+        }
         if (se === null) return done(prog + ": invalid option -- '" + c + "'");
         if (se === "bool") { o[c] = true; continue; }
         var val = chars.slice(k + 1);
@@ -948,7 +976,14 @@
   function cmdFalse() { return { out: "", code: 1 }; }
   defCmd("true", cmdTrue); defBui("true", cmdTrue);
   defCmd("false", cmdFalse); defBui("false", cmdFalse);
-  defCmd("yes", function (args) { return { out: new Array(21).join((args.join(" ") || "y") + "\n"), code: 0 }; });
+  // yes(1) never ends; a finite run stands in for that, long enough that
+  // `yes | head -n 40` sees forty lines, which is how it is normally used.
+  defCmd("yes", function (args) {
+    var line = (args.join(" ") || "y") + "\n";
+    var out = "";
+    for (var i = 0; i < 10000; i++) out += line;
+    return { out: out, code: 0 };
+  });
   defCmd("sleep", function (args) { return { out: "", code: 0, sleep: parseFloat(args[0] || "1") }; });
 
   defCmd("uname", function (args) {
@@ -1659,7 +1694,7 @@
       argv.shift();
     }
 
-    var rIn = null, rOut = null, rAppend = false, mergeErr = false;
+    var rIn = null, rOut = null, rErrOut = null, rAppend = false, mergeErr = false;
     for (i = 0; i < node.redirs.length; i++) {
       var rd = node.redirs[i];
       // NB: a dup target is an fd number, not a path -- "1" must not become
@@ -1667,6 +1702,7 @@
       var target = this.expand(rd.target.segs);
       if (rd.op === "<") rIn = this.path(target);
       else if (rd.dup) { if (target === "1" || target === "&1") mergeErr = true; }
+      else if (rd.fd === 2) { rErrOut = this.path(target); rAppend = rd.op === ">>"; }
       else { rOut = this.path(target); rAppend = rd.op === ">>"; }
     }
 
@@ -1735,6 +1771,8 @@
     var outText = res.out || "";
     if (mergeErr) { outText += errText; errText = ""; }   // 2>&1
     if (rOut) { V.writeFile(rOut, outText, rAppend); outText = ""; }
+    // `cmd 2> file` sends the diagnostics to the file, not to the terminal
+    if (rErrOut && errText) { V.writeFile(rErrOut, errText, rAppend); errText = ""; }
     return { out: outText, err: errText };
   };
   Shell.prototype._takeErr = function () { var e = this._curErr; this._curErr = ""; return e; };
