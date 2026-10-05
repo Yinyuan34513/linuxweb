@@ -503,6 +503,14 @@
         }
         if (se === null) return done(prog + ": invalid option -- '" + c + "'");
         if (se === "bool") { o[c] = true; continue; }
+        if (se === "optarg") {
+          // the value is only recognised when glued to the letter, so
+          // `od -w 2` sets no width and reads a file called "2"
+          var attached = chars.slice(k + 1);
+          o[c] = attached || true;
+          k = chars.length - 1;
+          continue;
+        }
         var val = chars.slice(k + 1);
         if (!val) {
           if (i < args.length) val = args[i++];
@@ -943,20 +951,64 @@
   defCmd("echo", cmdEcho, "echo - write arguments to standard output");
   defBui("echo", cmdEcho);
 
+  // printf(1): the format is reused until the arguments run out, so
+  // `printf 'a%.0s' 1 2 3` prints aaa, and a missing argument is empty.
+  // The conversion is %[flags][width][.precision]conv, with `*` taking the
+  // width or precision from the argument list.
+  var PRINTF_RE = /%([-+ #0']*)(\d+|\*)?(?:\.(\d+|\*))?([sdbxXouefgc])/g;
+
   function cmdPrintf(args) {
     if (!args.length) return { out: "", code: 0 };
     var fmt = expandEscapes(args.shift()).text;
-    var i = 0, out = "", stop = false;
-    out = fmt.replace(/%(-?\d*)?([sdb])|%b|%%/g, function (m, w, conv) {
-      if (m === "%%") return "%";
-      var a = args[i++] || "";
-      if (m === "%b") return expandEscapes(a).text;      // %b expands escapes too
-      if (conv === "d") {
-        var v = String(parseInt(a, 10) || 0);
-        return w ? v.padStart(Math.abs(parseInt(w, 10)), " ") : v;
+    var out = "", argi = 0;                    // the cursor spans every pass
+
+    do {
+      var m, i, pass = "", at = 0, converted = false;
+      i = argi;
+      PRINTF_RE.lastIndex = 0;
+      while ((m = PRINTF_RE.exec(fmt)) !== null) {
+        pass += fmt.slice(at, m.index).replace(/%%/g, "%");
+        at = m.index + m[0].length;
+        converted = true;
+        var flags = m[1] || "", conv = m[4];
+        var width = m[2] === "*" ? (i < args.length ? parseInt(args[i++], 10) || 0 : 0)
+          : m[2] ? parseInt(m[2], 10) : 0;
+        var prec = m[3] === "*" ? (i < args.length ? parseInt(args[i++], 10) || 0 : 0)
+          : m[3] !== undefined ? parseInt(m[3], 10) : undefined;
+        var raw = i < args.length ? args[i++] : "";
+        var a = raw, text;
+        switch (conv) {
+          case "d": case "i": case "u":
+            a = String(parseInt(raw, 10) || 0);
+            if (prec !== undefined) a = String(Math.abs(parseInt(raw, 10) || 0)).padStart(prec, "0");
+            text = (flags.indexOf("+") >= 0 && parseInt(raw, 10) >= 0 ? "+" : "") + a;
+            break;
+          case "f": case "e": case "g":
+            text = (parseFloat(raw) || 0).toFixed(prec === undefined ? 6 : prec);
+            break;
+          case "x": text = (parseInt(raw, 10) || 0).toString(16); break;
+          case "X": text = (parseInt(raw, 10) || 0).toString(16).toUpperCase(); break;
+          case "o": text = (parseInt(raw, 10) || 0).toString(8); break;
+          case "c": text = raw ? raw.charAt(0) : ""; break;
+          case "b": text = expandEscapes(raw).text; break;
+          default: text = raw;
+        }
+        if (conv === "s" && prec !== undefined) text = text.slice(0, prec);
+        if (width) {
+          if (flags.indexOf("-") >= 0) text = text.padEnd(width, " ");
+          else if (flags.indexOf("0") >= 0 && "dioxXuf".indexOf(conv) >= 0) {
+            text = (text[0] === "+" || text[0] === "-" ? text[0] + text.slice(1).padStart(width - 1, "0")
+              : text.padStart(width, "0"));
+          } else text = text.padStart(width, " ");
+        }
+        pass += text;
       }
-      return w ? a.padStart(Math.abs(parseInt(w, 10)), " ") : a;
-    });
+      // a format with no conversion prints once, with %% collapsed
+      if (!converted) { out += fmt.replace(/%%/g, "%"); break; }
+      out += pass + fmt.slice(at).replace(/%%/g, "%");
+      argi = i;
+    } while (i < args.length);
+
     return { out: out, code: 0 };
   }
   defCmd("printf", cmdPrintf, "printf - format and print data");
@@ -2727,6 +2779,14 @@
           : "No such file or directory");
   }
 
+  // A usage complaint of the program's own -- "tr: missing operand" rather
+  // than a getopt error -- still ends with coreutils' hint line.
+  function usage(sh, prog, msg, code) {
+    sh._error(prog + ": " + msg);
+    sh._error("Try '" + prog + " --help' for more information.");
+    return { out: "", code: code === undefined ? 1 : code };
+  }
+
   // Walk a command's inputs: "-" (or no operand at all) is stdin, read at
   // most once per invocation, and an unreadable input is reported through
   // errFmt while the rest keeps going.  fn(text, name) sees each one; name
@@ -2756,7 +2816,7 @@
   LW.core = {
     defCmd: defCmd, defBui: defBui, opt: opt,
     getopt: getopt, finish: finish, doc: doc,
-    eachInput: eachInput, gnuErr: gnuErr,
+    eachInput: eachInput, gnuErr: gnuErr, usage: usage,
     sgr: sgr, human: human, CMDS: CMDS,
   };
 

@@ -167,6 +167,24 @@ const GROUPS = {
     ["simple", [], "printf 'a b\\nb c\\n' | tsort"],
     ["loop", [], "printf 'a b\\nb a\\n' | tsort"],
   ],
+  // ---- the shell's own printf -------------------------------------------
+  printf: [
+    ["literal", [], "printf 'hello'"],
+    ["escapes", [], "printf 'a\\tb\\nc\\n'"],
+    ["one substitution", [], "printf '%s\\n' abc"],
+    ["reuse the format", [], "printf 'a%.0s' 1 2 3"],
+    ["pairs", [], "printf '%s-%s\\n' a b"],
+    ["right align", [], "printf '[%5s]\\n' ab"],
+    ["left align", [], "printf '[%-5s]\\n' ab"],
+    ["zero pad", [], "printf '%05d\\n' 42"],
+    ["star width", [], "printf '%*d|\\n' 4 7"],
+    ["precision", [], "printf '%.2f\\n' 3.14159"],
+    ["percent", [], "printf '100%%\\n'"],
+    ["hex", [], "printf '%x %X\\n' 255 255"],
+    ["missing argument", [], "printf '%s\\n'"],
+    ["no argument", [], "printf 'plain\\n'"],
+  ],
+
   // ---- checksums and encodings ----------------------------------------
   digest: [
     ["md5", [], "printf 'abc' | md5sum"],

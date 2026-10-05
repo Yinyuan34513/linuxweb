@@ -143,20 +143,39 @@
   // ------------------------------------------------------------- digests ----
 
   // CRC-32 (IEEE), what cksum uses.
+  // cksum's CRC is not the IEEE CRC-32: GNU generates its table from GEN,
+  //   GEN = X^26+X^23+X^22+X^16+X^12+X^11+X^10+X^8+X^7+X^5+X^4+X^2+X+1
+  // and then folds the file's *length* into the checksum before complementing
+  // it.  Both parts are needed: `printf abc | cksum` is 1219131554, while the
+  // IEEE CRC-32 of the same bytes is 891568578.
   var CRC_TABLE = (function () {
+    var GEN = 0x04000000 | 0x00800000 | 0x00400000 | 0x00010000 | 0x00001000 |
+               0x00000800 | 0x00000400 | 0x00000100 | 0x00000080 | 0x00000020 |
+               0x00000010 | 0x00000004 | 0x00000002 | 0x00000001;
+    var r = [GEN];
+    for (var i = 1; i < 8; i++) {
+      r.push(((r[i - 1] << 1) ^ ((r[i - 1] & 0x80000000) ? GEN : 0)) >>> 0);
+    }
     var table = [];
     for (var n = 0; n < 256; n++) {
-      var c = n;
-      for (var k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-      table[n] = c >>> 0;
+      var rem = 0;
+      for (var b = 0; b < 8; b++) if (n & (1 << b)) rem = (rem ^ r[b]) >>> 0;
+      table.push(rem >>> 0);
     }
     return table;
   })();
 
-  function crc32(bs, seed) {
-    var c = (seed === undefined ? 0 : seed) ^ 0xffffffff;
-    for (var i = 0; i < bs.length; i++) c = CRC_TABLE[(c ^ bs[i]) & 0xff] ^ (c >>> 8);
-    return (c ^ 0xffffffff) >>> 0;
+  function crc32(bs) {
+    var crc = 0;
+    for (var i = 0; i < bs.length; i++) {
+      crc = (((crc << 8) >>> 0) ^ CRC_TABLE[((crc >> 24) ^ bs[i]) & 0xff]) >>> 0;
+    }
+    var n = bs.length;                       // the length goes in, low byte first
+    while (n) {
+      crc = (((crc << 8) >>> 0) ^ CRC_TABLE[((crc >> 24) ^ (n & 0xff)) & 0xff]) >>> 0;
+      n = Math.floor(n / 256);
+    }
+    return (~crc) >>> 0;
   }
 
   // System V's sum(1) checksum: add each byte and fold the carry back into the
@@ -503,7 +522,7 @@
       var g = getopt(name, args, {
         short: { b: "bool", c: "bool", t: "bool", w: "arg", z: "bool",
                  l: "arg", "0": "bool" },
-        long: { binary: "bool", check: ["bool", "c"], tag: "bool", untagged: "bool",
+        long: { binary: "bool", check: ["bool", "c"], tag: "bool",
                 status: "bool", strict: "bool", warn: ["bool", "w"],
                 zero: ["bool", "z"], length: ["arg", "l"],
                 "ignore-missing": "bool", quiet: "bool", text: "bool" },
@@ -517,11 +536,12 @@
       var out = "", code = 0;
       var tagged = o.untagged ? false : true;
       if (!g._.length) {
-        out = hex(fn(bytes(stdin))) + "\n";
+        // no operand at all: standard input, and it is still named "-"
+        out = hex(fn(bytes(stdin), o)) + (o.z ? " *-\0" : "  -") + "\n";
         return { out: out, code: 0 };
       }
       code = inputs(name, g._, stdin, sh, gnuErr, function (text, fname) {
-        var sum = hex(fn(bytes(text)));
+        var sum = hex(fn(bytes(text), o));
         // standard input is reported as "-", like every coreutils checksum tool
         if (o.z) {
           out += sum + " *" + escaped(fname === null ? "-" : fname) + "\0";
@@ -573,7 +593,11 @@
   digestCmd("sha256sum", sha256);
   digestCmd("sha384sum", sha384);
   digestCmd("sha512sum", sha512);
-  digestCmd("b2sum", function (bs) { return blake2b(bs, 512); });
+  // -l BITS picks the digest length; BLAKE2b folds it into the parameter
+  // block, so a 256-bit digest is not a prefix of the 512-bit one.
+  digestCmd("b2sum", function (bs, o) {
+    return blake2b(bs, o && o.l !== undefined ? parseInt(o.l, 10) : 512);
+  });
 
   // ---- cksum: CRC by default, but --algorithm picks any of the family ------
   //

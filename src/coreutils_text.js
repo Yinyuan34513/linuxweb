@@ -15,6 +15,7 @@
   var def = LW.core.defCmd;
   var getopt = LW.core.getopt, finish = LW.core.finish;
   var eachInput = LW.core.eachInput, gnuErr = LW.core.gnuErr;
+  var usage = LW.core.usage;
 
   // ---------------------------------------------------------------- shared --
 
@@ -261,11 +262,13 @@
     var keys = parseKeys(o.k);
 
     var text = "", code = 0;
+    // sort reports a bad operand with status 2, like a usage error
     code = inputs("sort", g._, stdin, sh, function (p, name, kind) {
       return "sort: cannot read: " + name + ": " +
         (kind === "dir" ? "Is a directory"
           : kind === "perm" ? "Permission denied" : "No such file or directory");
     }, function (t) { text += t; });
+    if (code) code = 2;
 
     var l = lines(text);
     if (o.c) {
@@ -302,29 +305,66 @@
     }
 
     function keyCompare(a, b, key) {
-      var fa = field(a, key.from), fb = field(b, key.from);
-      var la = key.to === undefined ? fa : field(a, key.to);
-      var lb = key.to === undefined ? fb : field(b, key.to);
-      var va = la.slice(fa.length), vb = lb.slice(fb.length);   // drop common prefix
+      var va = keyText(a, key), vb = keyText(b, key);
       if (key.ignoreBlanks) {
         va = va.replace(/^[ \t]+/, ""); vb = vb.replace(/^[ \t]+/, "");
       }
+      var r;
       switch (key.type) {
-        case "n": return numCompare(va, vb);
-        case "g": return floatCompare(va, vb);
-        case "h": return humanCompare(va, vb);
-        case "V": return versionCompare(va, vb);
-        case "b": return foldCompare(va, vb);
-        default: return strCompare(va, vb);
+        case "n": r = numCompare(va, vb); break;
+        case "g": r = floatCompare(va, vb); break;
+        case "h": r = humanCompare(va, vb); break;
+        case "V": r = versionCompare(va, vb); break;
+        case "b": r = foldCompare(va, vb); break;
+        default: r = strCompare(va, vb);
       }
+      return key.reverse ? -r : r;
     }
 
-    function field(line, n) {
-      if (n === 0) return "";
-      var parts = sep ? line.split(sep) : line.split(/[ \t]+/).filter(function (x, i) {
-        return !(i === 0 && x === "") && x !== "";
-      });
-      return (parts[n - 1] === undefined ? "" : parts[n - 1]);
+    // The field spans of a line as [start, end) offsets.  With no -t the
+    // fields are runs of non-blanks and the blanks between them trail the
+    // field before, which is what makes `sort -k2` start at the first letter
+    // rather than at the blank in front of it.
+    function fieldSpans(line) {
+      var out = [], i = 0;
+      if (sep) {
+        var start = 0;
+        for (;;) {
+          var at = line.indexOf(sep, i);
+          if (at < 0) { out.push([start, line.length]); break; }
+          out.push([start, at]);
+          start = at + sep.length;
+          i = start;
+        }
+        return out;
+      }
+      while (i < line.length) {
+        while (i < line.length && /\s/.test(line.charAt(i))) i++;
+        if (i >= line.length) break;
+        var s0 = i;
+        while (i < line.length && !/\s/.test(line.charAt(i))) i++;
+        out.push([s0, i]);
+        while (i < line.length && /\s/.test(line.charAt(i))) i++;   // blanks trail
+      }
+      return out;
+    }
+
+    // -k names a *span*: from the start of the first field (plus any .CHAR
+    // offset) to the end of the last one, which is not the same as either
+    // field on its own.
+    function keyText(line, key) {
+      var f = fieldSpans(line);
+      var from = key.from - 1;
+      if (from < 0) from = 0;
+      if (from >= f.length) return "";
+      var start = f[from][0] + key.fromChar;
+      var end;
+      if (key.to === undefined) end = line.length;
+      else {
+        var to = Math.min(key.to - 1, f.length - 1);
+        end = key.toChar ? f[to][0] + key.toChar : f[to][1];
+      }
+      return line.slice(start, Math.max(start, end));
     }
 
     function fullCompare(a, b) {
@@ -338,19 +378,20 @@
 
     return { out: out, code: code };
 
+    // -k takes FIELD[.CHAR][OPTS][, FIELD[.CHAR][OPTS]]; several keys may be
+    // given as one newline-separated string.
     function parseKeys(spec) {
       if (spec === undefined) return [];
-      return String(spec).split(/\n/).filter(Boolean).map(function (one) {
-        // FIELD[.START][OPTS][, FIELD[.START][OPTS]]
-        var key = { from: 1, to: undefined, type: "s", ignoreBlanks: !!o.b };
-        var parts = String(one).split(",");
-        for (var i = 0; i < parts.length; i++) {
-          var piece = parts[i].trim();
-          if (!piece) continue;
+      return String(spec).split("\n").filter(Boolean).map(function (one) {
+        var key = { from: 1, fromChar: 0, to: undefined, toChar: 0, type: "s", ignoreBlanks: !!o.b };
+        String(one).split(",").forEach(function (piece, i) {
+          piece = piece.trim();
+          if (!piece) return;
           var m = /^(\d+)(?:\.(\d+))?(.*)$/.exec(piece);
-          if (!m) continue;
-          var num = parseInt(m[1], 10);
-          if (i === 0) key.from = num; else key.to = num;
+          if (!m) return;
+          var num = parseInt(m[1], 10), ch = m[2] ? parseInt(m[2], 10) : 0;
+          if (i === 0) { key.from = num; key.fromChar = ch; }
+          else { key.to = num; key.toChar = ch; }
           var opts = m[3] || "";
           if (opts.indexOf("b") >= 0) key.ignoreBlanks = true;
           if (opts.indexOf("n") >= 0) key.type = "n";
@@ -358,8 +399,8 @@
           else if (opts.indexOf("h") >= 0) key.type = "h";
           else if (opts.indexOf("V") >= 0) key.type = "V";
           else if (opts.indexOf("r") >= 0) key.reverse = true;
-          else if (opts.indexOf("f") >= 0) key.from = key.to = num;
-        }
+          else if (opts.indexOf("f") >= 0) { key.to = key.from; key.toChar = ch; }
+        });
         return key;
       });
     }
@@ -490,9 +531,8 @@
     var o = g.o;
     var sets = g._;
     if (!sets.length || sets.length > 2) {
-      sh._error(sets.length ? "tr: extra operand '" + sets[2] + "'"
-        : "tr: missing operand");
-      return { out: "", code: 1 };
+      return usage(sh, "tr", sets.length ? "extra operand '" + sets[2] + "'"
+        : "missing operand");
     }
     var set1, set2 = null;
     try {
@@ -632,8 +672,7 @@
     var modes = [o.b !== undefined ? "b" : null, o.c !== undefined ? "c" : null,
                  o.f !== undefined ? "f" : null].filter(Boolean);
     if (modes.length !== 1) {
-      sh._error("cut: you must specify a list of bytes, characters, or fields");
-      return { out: "", code: 1 };
+      return usage(sh, "cut", "you must specify a list of bytes, characters, or fields");
     }
     var mode = modes[0];
     var list = parseList(mode === "f" ? o.f : mode === "b" ? o.b : o.c);
@@ -682,14 +721,16 @@
         return [parseInt(m[1], 10), parseInt(m[2], 10)];
       }).filter(function (r) { return r && r[0] > 0; });
     }
+    // --complement prints everything the list leaves out.  An open-ended
+    // range reaches the end of the line, so the upper bound stays huge.
     function ranges(l, comp) {
       if (!comp) return l;
-      var keep = [], field = 1;
-      var sorted = l.slice().sort(function (a, b) { return a[0] - b[0]; });
-      sorted.forEach(function (r) {
-        if (r[0] > field) keep.push([field, Math.min(r[0] - 1, 1e9)]);
-        field = Math.max(field, r[1] === 1e9 ? 1e9 : r[1] + 1);
+      var keep = [], next = 1;
+      l.slice().sort(function (a, b) { return a[0] - b[0]; }).forEach(function (r) {
+        if (r[0] > next) keep.push([next, r[0] - 1]);
+        next = Math.max(next, r[1] === 1e9 ? 1e9 : r[1] + 1);
       });
+      if (next <= 1e9) keep.push([next, 1e9]);          // everything after the last
       return keep;
     }
   }, "remove sections from each line of files");
@@ -737,10 +778,12 @@
         var body = line === "" ? blankStyle : bodyStyle;
         if (body === "p") return;                  // "no numbers"
         var number = "";
-        if (body === "a") number = String(start);           // number, don't count
-        else if (body === "n") { if (line !== "") number = String(start++); }
+        if (body === "n") { if (line !== "") number = String(start++); }
         else number = String(start++);
-        out += (number ? number.padStart(width) + sep : "") + line + "\n";
+        // an unnumbered line still occupies the number field, in blanks
+        out += number
+          ? number.padStart(width) + sep + line + "\n"
+          : " ".repeat(width + 1) + line + "\n";
       });
     });
     return { out: out, code: code };
@@ -939,118 +982,137 @@
           out += line + "\n";
           return;
         }
-        para.push(line.trim());
+        line.trim().split(/\s+/).forEach(function (word) {
+          if (word) para.push(word);
+        });
       });
       flush();
     });
     return { out: out, code: code };
 
+    // Fill to the width, then pull words back if that left the last line
+    // shorter than a quarter of it: `fmt -w 20` of five words gives
+    // "aaaa bbbb cccc" / "dddd eeee" rather than leaving "eeee" alone.
     function wrap(words, w) {
-      var line = "", out2 = "";
+      var lines2 = [], line = "";
       words.forEach(function (word) {
         if (!line.length) { line = word; return; }
         if (line.length + 1 + word.length <= w) { line += " " + word; return; }
-        out2 += line + "\n";
+        lines2.push(line);
         line = word;
       });
-      if (line.length) out2 += line;
-      return out2;
+      if (line.length) lines2.push(line);
+      while (lines2.length > 1) {
+        var last = lines2[lines2.length - 1];
+        if (last.length >= Math.floor(w / 4)) break;
+        var prev = lines2[lines2.length - 2];
+        var cut = prev.lastIndexOf(" ");
+        if (cut < 0) break;
+        lines2[lines2.length - 2] = prev.slice(0, cut);
+        lines2[lines2.length - 1] = prev.slice(cut + 1) + " " + last;
+      }
+      return lines2.join("\n");
     }
   }, "reformat paragraph text");
 
   // ---- join ----------------------------------------------------------------
   //
-  // Joins on the -j field (default: the first, comparing by -1), -o decides
-  // the output fields as FILE.FIELD, and a missing pair is reported as
-  // "no match" unless -a is given.
+  // Joins two files on a field: -j FIELD for both, -1/-2 to choose separately.
+  // The default output is the join field, then the rest of file 1, then all of
+  // file 2 -- and -o FILE.FIELD picks the fields explicitly.  -a prints the
+  // unpaired lines too, -v only those.
   def("join", function (args, stdin, sh) {
     var g = getopt("join", args, {
-      short: { a: "bool", e: "arg", o: "arg", t: "arg", i: "arg", "1": "arg",
-               "2": "arg", v: "bool", z: "bool", "0": "bool" },
-      long: { "ignore-case": "bool", "unpaired": ["bool", "a"], check: "bool",
-              format: ["arg", "o"], "empty": "bool", separator: ["arg", "t"],
-              "no-split-lines": "bool", verbose: "bool", "zero-terminated": ["bool", "z"] },
+      short: { a: "bool", e: "arg", j: "arg", o: "arg", t: "arg", i: "arg",
+               "1": "arg", "2": "arg", v: "bool", z: "bool", "0": "bool" },
+      long: { "ignore-case": "bool", unpaired: ["bool", "a"], check: "bool",
+              format: ["arg", "o"], empty: "bool", separator: ["arg", "t"],
+              "no-split-lines": "bool", verbose: "bool",
+              "zero-terminated": ["bool", "z"] },
     });
     var done = finish(sh, "join", g);
     if (done) return done;
     var o = g.o;
     if (g._.length < 2) {
-      sh._error("join: missing operand");
-      return { out: "", code: 1 };
+      return usage(sh, "join", g._.length
+        ? "missing operand after '" + g._[0] + "'"
+        : "missing operand");
     }
-    if (g._.length > 2) {
-      sh._error("join: extra operand '" + g._[2] + "'");
-      return { out: "", code: 1 };
-    }
+    if (g._.length > 2) return usage(sh, "join", "extra operand '" + g._[2] + "'");
+
     var sep = o.t === undefined ? " " : unescapeSep(o.t);
-    var out = "", code = 0;
-    var t1 = "", t2 = "";
+    var j1 = parseInt(o["1"] === undefined ? (o.j === undefined ? 1 : o.j) : o["1"], 10);
+    var j2 = parseInt(o["2"] === undefined ? (o.j === undefined ? 1 : o.j) : o["2"], 10);
+    var t1 = "", t2 = "", code = 0;
     code = inputs("join", g._.slice(0, 1), stdin, sh, gnuErr, function (t) { t1 = t; });
     code |= inputs("join", g._.slice(1), stdin, sh, gnuErr, function (t) { t2 = t; });
+    var rows1 = splitFields(t1), rows2 = splitFields(t2);
+    var format = parseFormat(o.o, j1);
 
-    var f1 = splitJoinLines(t1, sep), f2 = splitJoinLines(t2, sep);
-    var j1 = o["1"] === undefined ? 1 : parseInt(o["1"], 10);
-    var j2 = o["2"] === undefined ? 1 : parseInt(o["2"], 10);
-    var order = parseJoinFormat(o.o);
-    var used = {};
-
-    f1.forEach(function (line1, idx1) {
-      var match = -1;
-      for (var i = idx1 + 1; i < f1.length; i++) {
-        for (var k = 0; k < f2.length; k++) {
-          if (keyEq(f1[i], f2[k], sep, j1, j2)) { match = i; break; }
-        }
-        if (match >= 0) break;
+    var out = "", used2 = {}, i, k;
+    for (i = 0; i < rows1.length; i++) {
+      var line1 = rows1[i], match = -1;
+      for (k = 0; k < rows2.length; k++) {
+        if (keyEq(line1, rows2[k], j1, j2)) { match = k; break; }
       }
       if (match < 0) {
         if (o.a) out += line1.join(sep) + "\n";
-        else if (o.e !== undefined) sh._error("join: " + line1.join(sep));
-        return;
+        else if (o.v) out += line1.join(sep) + "\n";
+        if (o.v) sh._error("join: " + line1.join(sep));
+        continue;
       }
-      used[match] = 1;
-      var fields = [];
-      order.forEach(function (spec) {
-        var row = spec[0] === 0 ? f1 : f2;
-        var idx = spec[0] === 0 ? idx1 : match;
-        var col = spec[1];
-        fields.push(row[idx][col] === undefined ? "" : row[idx][col]);
-      });
-      out += fields.join(sep) + "\n";
-    });
-    if (!o.a && o.e === undefined) {
-      Object.keys(used).forEach(function (k) { /* paired rows are consumed */ });
-      f2.forEach(function (line2, idx2) {
-        var paired = false;
-        for (var i = 0; i < f1.length && !paired; i++) {
-          if (keyEq(f1[i], line2, sep, j1, j2)) paired = true;
+      used2[match] = true;
+      if (!o.v) out += emit(format, line1, rows2[match], sep) + "\n";
+    }
+    if (o.v || o.a2) {
+      for (k = 0; k < rows2.length; k++) {
+        if (used2[k]) continue;
+        if (o.a) out += rows2[k].join(sep) + "\n";
+        if (o.v) {
+          out += rows2[k].join(sep) + "\n";
+          sh._error("join: " + rows2[k].join(sep));
         }
-        if (!paired && o.v) sh._error("join: " + line2.join(sep));
-      });
+      }
     }
     return { out: out, code: code };
 
-    function splitJoinLines(text, separator) {
+    function splitFields(text) {
       return lines(text).a.map(function (line) {
-        return separator === " " ? line.split(/[ \t]+/).filter(Boolean) : line.split(separator);
+        if (sep === " ") return line.split(/[ \t]+/).filter(function (x) { return x !== ""; });
+        return line.split(sep);
       });
     }
-    function keyEq(a, b, separator, k1, k2) {
+    function keyEq(a, b, k1, k2) {
       var x = a[k1 - 1], y = b[k2 - 1];
       if (x === undefined || y === undefined) return false;
       if (o.i) { x = x.toLowerCase(); y = y.toLowerCase(); }
       return x === y;
     }
-    function parseJoinFormat(spec) {
-      // default: the join field, then the rest of file 1, then all of file 2
-      if (spec === undefined) {
-        var f = [[0, j1 - 1]];
-        f1.concat().length;                                  // keep shape stable
-        return f;
-      }
-      return String(spec).split(/\s+/).map(function (piece) {
+    // Without -o the layout is: the join field, the rest of file 1, all of
+    // file 2.  With it, every field is named FILE.FIELD.
+    function parseFormat(spec, joinField) {
+      if (spec === undefined) return null;
+      return String(spec).split(/[ ,]+/).filter(Boolean).map(function (piece) {
         var m = /^(\d+)\.(\d+)$/.exec(piece);
-        return m ? [parseInt(m[1], 10) - 1, parseInt(m[2], 10) - 1] : null;
-      }).filter(Boolean);
+        if (m) return [parseInt(m[1], 10) - 1, parseInt(m[2], 10) - 1];
+        var f = /^(\d+)$/.exec(piece);
+        if (f) return [0, parseInt(f[1], 10) - 1];      // 0 means "file 1"
+        return [0, 0];
+      });
+    }
+    function emit(format, line1, line2, separator) {
+      if (!format) {
+        // the join field, then the rest of file 1, then all of file 2 that
+        // is not its own join field
+        var cells = [line1[j1 - 1]];
+        for (var a = 0; a < line1.length; a++) if (a !== j1 - 1) cells.push(line1[a]);
+        for (var b = 0; b < line2.length; b++) if (b !== j2 - 1) cells.push(line2[b]);
+        return cells.join(separator);
+      }
+      return format.map(function (spec) {
+        var row = spec[0] === 0 ? line1 : line2;
+        return row[spec[1]] === undefined ? "" : row[spec[1]];
+      }).join(separator);
     }
   }, "relational database join");
 
@@ -1077,17 +1139,27 @@
     // The three columns come out in one sorted stream: a line unique to file 1
     // is flush left, one unique to file 2 is indented by two tabs, and a
     // common line by one.
+    // A column is indented by one tab per *printed* column before it, so -1
+    // and -2 move the remaining columns left rather than leaving a gap.
+    var indent = [0, 0, 0];
+    var seen = 0;
+    [1, 2, 3].forEach(function (col) {
+      if (o[String(col)]) { indent[col - 1] = -1; return; }
+      indent[col - 1] = seen++;
+    });
+    var pad = function (col) { return "\t".repeat(indent[col - 1]); };
+
     var out = "", n1 = 0, n2 = 0, nBoth = 0;
     var i = 0, j = 0;
     while (i < a.length || j < b.length) {
       if (i < a.length && (j >= b.length || a[i] < b[j])) {
-        if (!o["1"]) out += a[i] + "\n";
+        if (!o["1"]) out += pad(1) + a[i] + "\n";
         n1++; i++;
       } else if (j < b.length && (i >= a.length || b[j] < a[i])) {
-        if (!o["2"]) out += "\t\t" + b[j] + "\n";
+        if (!o["2"]) out += pad(2) + b[j] + "\n";
         n2++; j++;
       } else {
-        if (!o["3"]) out += "\t" + a[i] + "\n";
+        if (!o["3"]) out += pad(3) + a[i] + "\n";
         nBoth++; i++; j++;
       }
     }
@@ -1132,7 +1204,7 @@
     // delimiter: `seq 3 | paste -sd,` is "1,2,3".
     if (o.s) {
       texts.forEach(function (t) {
-        out += lines(t).a.join(delimList[0]) + "\\n";
+        out += lines(t).a.join(delimList[0]) + "\n";
       });
       return { out: out, code: code };
     }
@@ -1164,15 +1236,17 @@
     var done = finish(sh, "split", g);
     if (done) return done;
     var o = g.o;
-    if (!g._.length) {
-      sh._error("split: missing operand");
-      return { out: "", code: 1 };
-    }
-    var file = g._[0];
-    var text = V.readFile(sh.path(file));
-    if (text === null) {
-      sh._error(openErr("split", file, V.getNode(sh.path(file)) ? "dir" : "missing"));
-      return { out: "", code: 1 };
+    // with no operand split reads standard input and writes x00, x01, ...
+    var file = g._.length ? g._[0] : null;
+    var text;
+    if (file === null) {
+      text = stdin || "";
+    } else {
+      text = V.readFile(sh.path(file));
+      if (text === null) {
+        sh._error(openErr("split", file, V.getNode(sh.path(file)) ? "dir" : "missing"));
+        return { out: "", code: 1 };
+      }
     }
     var prefix = o.p === undefined ? "x" : o.p;
     var suffixLen = o.a === undefined ? 2 : parseInt(o.a, 10);
@@ -1205,9 +1279,10 @@
   // address radix and -N/-j/-i offset and skip.
   def("od", function (args, stdin, sh) {
     var g = getopt("od", args, {
+      // there is no -w in od; the page width is --width-bytes only
       short: { A: "arg", b: "bool", c: "bool", d: "bool", f: "bool", i: "arg",
                j: "arg", N: "arg", o: "bool", t: "arg", v: "bool", x: "bool",
-               w: "arg", "0": "bool" },
+               w: "optarg", "0": "bool" },
       long: { address_radix: ["arg", "A"], "skip-bytes": ["arg", "j"],
               "read-bytes": ["arg", "N"], format: ["arg", "t"],
               "width-bytes": ["arg", "w"], "endian": "bool" },
@@ -1230,7 +1305,7 @@
 
     // A per-byte presentation (-b octal, -x hex, -c characters, -t TYPE) or the
     // default, which packs two bytes into one octal word.
-    var type = o.b ? "o" : o.x ? "x" : o.c ? "c" : o.d ? "d" : null;
+    var type = o.b ? "ob" : o.x ? "x" : o.c ? "c" : o.d ? "d" : null;
     var size = 1;
     if (o.t !== undefined) {
       var t = /^([oxdcfa])(\d*)$/.exec(String(o.t).replace(/^0?/, ""));
@@ -1273,6 +1348,10 @@
     function cellText(cell, kind, width) {
       var n = cell.reduce(function (acc, c) { return acc * 256 + (c.charCodeAt(0) & 0xff); }, 0);
       switch (kind) {
+        case "ob":
+          return cell.map(function (c) {
+            return (c.charCodeAt(0) & 0xff).toString(8).padStart(3, "0");
+          }).join("") + " ";
         case "x":
           return cell.map(function (c) {
             return (c.charCodeAt(0) & 0xff).toString(16).padStart(2, "0");
@@ -1289,9 +1368,12 @@
             return b >= 32 && b < 127 ? "  " + c : "   .";
           }).join("");
         default:
-          return cell.map(function (c) {
-            return (c.charCodeAt(0) & 0xff).toString(8).padStart(width > 1 ? 3 : 2, "0");
-          }).join("") + " ";
+          // One little-endian octal word for the cell: `printf ab | od`
+          // prints 061141, which is 0x6261.
+          var word = 0;
+          for (var q = cell.length - 1; q >= 0; q--) word = word * 256 + (cell[q].charCodeAt(0) & 0xff);
+          // a lone trailing byte still fills a whole two-byte word: 000147
+          return word.toString(8).padStart(Math.max(6, 3 * cell.length), "0") + " ";
       }
     }
 
@@ -1463,9 +1545,8 @@
     var v = n;
     while (v >= div && i < spec.units.length - 1) { v /= div; i++; }
     if (i === 0) return String(Math.round(v * 100) / 100);
-    var text = v.toFixed(1);
-    if (/\.0$/.test(text)) text = text.slice(0, -2);
-    return text + spec.units[i];
+    // 1048576 -> "1.0M": a scaled value always keeps one decimal
+    return v.toFixed(1) + spec.units[i];
   }
 
   // ---- seq -----------------------------------------------------------------
@@ -1473,7 +1554,7 @@
   // [FIRST [INCREMENT]] LAST, with -s SEPARATOR, -w WIDTH, -f FORMAT.
   def("seq", function (args, stdin, sh) {
     var g = getopt("seq", args, {
-      short: { s: "arg", w: "arg", f: "arg", t: "bool", i: "arg", "0": "bool" },
+      short: { s: "arg", w: "bool", f: "arg", t: "bool", i: "arg", "0": "bool" },
       long: { separator: ["arg", "s"], format: ["arg", "f"], width: ["arg", "w"],
               equal: ["bool", "="], "float": ["bool", "f"],
               "invalid-option": "bool" },
@@ -1491,8 +1572,8 @@
       return { out: "", code: 1 };
     }
     if (step === 0) {
-      sh._error("seq: invalid Zero increment value");
-      return { out: "", code: 1 };
+      return usage(sh, "seq", "invalid Zero increment value: '" +
+        (nums[1] === undefined ? "1" : nums[1]) + "'");
     }
     var body = [], v = first;
     var isFloat = /\./.test(nums.join(" "));
@@ -1504,13 +1585,15 @@
       }) : isFloat ? String(Math.round(v * 1e6) / 1e6) : String(v));
       v += step;
     }
-    var text = body.join(o.s === undefined ? "\n" : unescapeSep(o.s));
+    // -w is a *minimum*: the numbers are padded to as many digits as the
+    // largest one needs, so `seq -w 8 10` prints 08 09 10 and not eight digits
+    var eol = o.s === undefined ? "\n" : unescapeSep(o.s);
     if (o.w !== undefined) {
-      var w = parseInt(o.w, 10);
-      text = body.map(function (x) { return x.padStart(w, "0"); }).join(o.s === undefined ? "\n" : unescapeSep(o.s));
+      var width = 0;
+      body.forEach(function (x) { width = Math.max(width, x.length); });
+      body = body.map(function (x) { return x.padStart(width, "0"); });
     }
-    if (text.length) text += o.s === undefined ? "\n" : "";
-    return { out: text, code: 0 };
+    return { out: body.join(eol) + (body.length ? "\n" : ""), code: 0 };
   }, "print a sequence of numbers");
 
   // ---- ptx -----------------------------------------------------------------
@@ -1655,25 +1738,27 @@
       parts.forEach(function (p) { if (names.indexOf(p) < 0) names.push(p); });
       edges.push([parts[0], parts[1]]);
     });
-    var ordered = [], visiting = {}, seen = {}, cycle = null;
+    // Each name is printed as it is first reached, so "a b" / "b c" gives
+    // a, b, c -- a depth-first walk, not the reverse post-order.
+    var ordered = [], visiting = {}, seen = {}, cycle = null, stack = [], loop = [];
     function visit(node) {
       if (seen[node]) return;
-      if (visiting[node]) { cycle = node; return; }
+      if (visiting[node]) {                                  // back edge: a loop
+        cycle = node;
+        loop = stack.slice(stack.indexOf(node));
+        return;
+      }
       visiting[node] = 1;
+      stack.push(node);
+      ordered.push(node);
       edges.forEach(function (e) { if (e[0] === node) visit(e[1]); });
       visiting[node] = 0;
+      stack.pop();
       seen[node] = 1;
-      ordered.push(node);
     }
     for (var i = 0; i < names.length && !cycle; i++) visit(names[i]);
     if (cycle) {
-      var loop = [], back = cycle;
-      do {
-        loop.unshift(back);
-        var prev = edges.filter(function (e) { return e[1] === back; }).pop();
-        back = prev && prev[0];
-        if (!back || back === cycle) break;
-      } while (back && back !== cycle);
+      // report the members of the loop in the order they were reached
       sh._error("tsort: -: input contains a loop:");
       loop.forEach(function (n) { sh._error("tsort: " + n); });
       return { out: ordered.join("\n") + (ordered.length ? "\n" : ""), code: 1 };
