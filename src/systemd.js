@@ -332,6 +332,13 @@
 
   // ---- the interface ------------------------------------------------------
 
+  // Seed as soon as the filesystem is ready -- the journal is the boot log, so
+  // it has to be in place before anyone asks for it, and the unit files belong
+  // on disk before the first `systemctl cat`.  The VFS runs these hooks after
+  // the tree is loaded, whether it came from IndexedDB or from memory, and init()
+  // is idempotent, so the commands can still call it themselves.
+  if (V && V.onLoad) V.onLoad.push(init);
+
   LW.systemd = {
     units: UNITS,
     unitFileText: unitFileText,

@@ -529,17 +529,26 @@ by `build_bootlog.py`).
 
 ## Run
 
-Open it directly — everything is inlined, so `file://` works (IndexedDB excepted):
-
-```sh
-xdg-open index.html
-```
-
-Or serve it (needed for a persistent filesystem):
+Serve it — that is the way to run it:
 
 ```sh
 python3 -m http.server 8000    # http://localhost:8000
 ```
+
+Opening `index.html` straight off the disk also works, and the console comes up,
+but Chrome treats a `file:` URL as a unique security origin and denies it
+IndexedDB, so the filesystem falls back to memory and every reload starts from a
+fresh machine. (A page inside a frame cannot load a `file:` URL at all — that is
+the "Unsafe attempt to load URL" warning in the console.)
+
+**After pulling a commit that adds or moves a script, reload hard** (Ctrl-Shift-R).
+The page is a list of `<script>` tags and browsers cache them individually, so a
+stale copy of one file can survive a reload and leave the page half-updated.
+
+`node tools/test_pageload.js` loads index.html's own script list, in the page's
+order, in a `vm` and then runs `systemctl`, `journalctl` and `dmesg` against it —
+which is how a missing `<script>` line or a file that needs something another file
+defines later gets caught here rather than in a browser console.
 
 ## Async commands
 

@@ -312,6 +312,14 @@
     ].join("\n");
   }
 
+  // src/systemd.js holds the unit table.  If it is not there -- an old cached
+  // copy of the page, or a partial checkout -- say so on stderr instead of
+  // failing with a TypeError from somewhere deep inside.
+  function noUnitTable(sh) {
+    sh._error("systemd: the unit table is not loaded (src/systemd.js)");
+    return { out: "", code: 1 };
+  }
+
   // How long ago something happened, the way systemd words it: the two largest
   // units and "ago".  `45s ago`, `1min 30s ago`, `2h 3min ago`, `5d 4h ago`.
   function humanAgo(seconds) {
@@ -349,7 +357,7 @@
     var done = finish(sh, "systemctl", g);
     if (done) return done;
     var S = LW.systemd;
-    if (!S) return { out: "", code: 1 };
+    if (!S) return noUnitTable(sh);
     S.init();
     var verbs = g._;
     var q = g.o.q || g.o.quiet, full = g.o.l || g.o.full, noPager = g.o["no-pager"];
@@ -725,7 +733,7 @@
     var done = finish(sh, "journalctl", g);
     if (done) return done;
     var S = LW.systemd;
-    if (!S) return { out: "", code: 1 };
+    if (!S) return noUnitTable(sh);
     S.init();
     var o = g.o;
 
