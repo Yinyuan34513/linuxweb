@@ -2402,4 +2402,11 @@
     return { out: ordered.join("\n") + (ordered.length ? "\n" : ""), code: code };
   }, "sort pairs of strings nontrivially");
 
+  // grep/sed/pgrep all compile POSIX patterns; sharing the compiler keeps an
+  // ERE meaning the same thing in every command.  extended=true is regcomp's
+  // REG_EXTENDED (ERE), false is BRE.
+  LW.ere = function (source, flags, extended) {
+    return new RegExp(expandPosix(sedPattern(source, !!extended)), flags);
+  };
+
 })(window.LW);

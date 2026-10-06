@@ -340,7 +340,9 @@
         continue;
       }
       if (x.op) break;
-      if (!x.empty) words.push(x);
+      // An empty word is still an argument: `printf '%s' '' a` passes two
+      // words, and dropping the first one changes what the command sees.
+      words.push(x);
       this.next();
     }
     return { kind: "simple", words: words, redirs: redirs };
@@ -1913,7 +1915,7 @@
         res = this.dispatch(name, argv.slice(1), input);
       }
     } catch (e) {
-      finishProcess(proc, 1);
+      finishProcess(this, proc, 1);
       this._curErr = prevErr;
       if (e && (e.__exit !== undefined || e.__return !== undefined)) throw e;
       this._error("bash: " + name + ": " + (e && e.message));
@@ -1940,7 +1942,7 @@
       return { out: "", err: mergeErr ? "" : errText };
     }
     this.status = res.code === undefined ? 0 : res.code;
-    finishProcess(proc, this.status);
+    finishProcess(this, proc, this.status);
     var outText = res.out || "";
     if (mergeErr) { outText += errText; errText = ""; }   // 2>&1
     if (rOut) { V.writeFile(rOut, outText, rAppend); outText = ""; }
@@ -2120,14 +2122,21 @@
       env: Object.keys(sh.env).sort().map(function (k) { return k + "=" + sh.env[k]; }),
     });
     // Every job is a process group of its own; without this the command
-    // would inherit the shell's group and `ps -o pgid` would lie.
-    if (e) e.pgid = e.pid;
+    // would inherit the shell's group and `ps -o pgid` would lie.  A command
+    // inside a command (sudo ls) nests, so remember the pid we replace.
+    if (e) {
+      e.pgid = e.pid;
+      e.prevCmdPid = sh._cmdPid || 0;
+      sh._cmdPid = e.pid;
+    }
     return e;
   }
 
-  function finishProcess(e, code) {
+  function finishProcess(sh, e, code) {
     var P = LW.proc;
-    if (!P || !e) return;
+    if (!e) return;
+    if (sh) sh._cmdPid = e.prevCmdPid || 0;
+    if (!P) return;
     P.exit(e.pid, code === undefined ? 0 : code);
     P.reap();
   }
@@ -2499,7 +2508,7 @@
         self.status = code === undefined ? 0 : code;
         self.busy = false;
         self._asyncIO = null;
-        finishProcess(self._asyncProc, self.status);
+        finishProcess(self, self._asyncProc, self.status);
         self._asyncProc = null;
         if (self.running) self.newPrompt();
       },
@@ -2512,7 +2521,7 @@
     var io = this._asyncIO;
     if (io) { io.aborted = true; if (io.timeout) clearTimeout(io.timeout); }
     this._asyncIO = null;
-    finishProcess(this._asyncProc, 130);
+    finishProcess(this, this._asyncProc, 130);
     this._asyncProc = null;
     this.busy = false;
     this.term.write("^C\n");

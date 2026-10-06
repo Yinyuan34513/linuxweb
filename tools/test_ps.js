@@ -51,7 +51,7 @@ eq("ps -f -p 99999", ps("-f -p 99999").out,
 eq("ps -l -p 99999", ps("-l -p 99999").out,
    "F S   UID     PID    PPID  C PRI  NI ADDR SZ WCHAN  TTY          TIME CMD\n");
 eq("ps -j -p 99999", ps("-j -p 99999").out,
-   "    PID    PGID   SID TTY          TIME CMD\n");
+   "    PID    PGID     SID TTY          TIME CMD\n");   // SID is a pid_max column
 eq("ps -O user -p 99999", ps("-O user -p 99999").out,
    "    PID USER     S TTY          TIME COMMAND\n");
 // pid 1 belongs to the shell's own world, so this checks the row too.

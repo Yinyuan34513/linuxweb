@@ -13,6 +13,7 @@
   "use strict";
 
   var P = LW.proc;
+  var V = LW.VFS;
   var def = LW.core.defCmd;
   var HELP = LW.PSHELP || {};
   var VER = LW.PSVER || {};
@@ -360,10 +361,11 @@
   };
 
   // Columns procps derives from /proc/sys/kernel/pid_max, printed wide
-  // enough for a seven-digit pid.
+  // enough for a seven-digit pid.  The set is output.c's CF_PIDMAX flag.
   var PIDMAX = {
-    cputime: 1, cutime: 1, pgid: 1, ppid: 1, pid: 1, sess: 1, spid: 1,
-    taskid: 1, tgid: 1, tid: 1, lwp: 1, tpgid: 1, pr26_pmapx: 1,
+    lwp: 1, pgid: 1, pgrp: 1, pid: 1, ppid: 1, sess: 1, session: 1, sid: 1,
+    spid: 1, taskid: 1, tgid: 1, tid: 1, tpgid: 1, tsess: 1, tsession: 1,
+    tsid: 1,
   };
 
   // format_array's neighbours: named combinations of specs (macro_array),
@@ -2391,6 +2393,557 @@
 
   def("ps", runPs, "report a snapshot of current processes");
   LW.PS = { run: runPs };
+
+  // ---- pgrep / pkill -------------------------------------------------------
+  //
+  // procps-ng 4.0.5's src/pgrep.c.  The part that decides what you see is
+  // select_procs(): every criterion is ANDed, the pattern is an ERE searched
+  // in comm (or in the whole command line with -f), and the pid of the pgrep
+  // asking the question is never one of the answers.
+
+  // usage('h') and usage('i') go to stdout and exit 0; usage('?') -- what
+  // getopt reaches for when it does not recognise something -- goes to stderr
+  // and exits 2.  The body is the real text procps_help.js captured.
+  function usageBody(prog) { return (HELP[prog] || HELP.pgrep || []).join("\n") + "\n"; }
+
+  function myUid(sh) {
+    var env = (sh && sh.env) || {};
+    if (env.UID !== undefined && env.UID !== "") {
+      var n = parseInt(env.UID, 10);
+      if (!isNaN(n)) return n;
+    }
+    return sh && sh.isRoot ? 0 : 1000;
+  }
+
+  // strict_atol(): optional sign, digits only, and an empty string is a zero.
+  function strictAtol(s) {
+    var i = 0, sign = 1;
+    if (s.charAt(0) === "+") i++;
+    else if (s.charAt(0) === "-") { i++; sign = -1; }
+    if (i >= s.length) return { ok: true, n: 0 };
+    for (; i < s.length; i++)
+      if (s.charAt(i) < "0" || s.charAt(i) > "9") return { ok: false };
+    var n = parseInt(s, 10);
+    return isFinite(n) ? { ok: true, n: sign * n } : { ok: false };
+  }
+
+  function lookupId(file, name, field) {
+    var t = V.readFile(file);
+    if (!t) return null;
+    var lines = t.split("\n");
+    for (var i = 0; i < lines.length; i++) {
+      var f = lines[i].split(":");
+      if (f[0] === name) return parseInt(f[field], 10);
+    }
+    return null;
+  }
+
+  // glibc's regerror() wording, which is all procps ever shows you.
+  function regexErrText(src) {
+    var depth = 0, i, c;
+    for (i = 0; i < src.length; i++) {
+      c = src.charAt(i);
+      if (c === "\\") { i++; continue; }
+      if (c === "(") depth++;
+      else if (c === ")") { if (--depth < 0) return "Unmatched ) or \\)"; }
+      else if (c === "[") {
+        var j = i + 1;
+        if (src.charAt(j) === "^") j++;
+        if (src.charAt(j) === "]") j++;
+        while (j < src.length && src.charAt(j) !== "]") {
+          if (src.charAt(j) === "\\") j++;
+          j++;
+        }
+        if (j >= src.length) return "Invalid regular expression";
+        i = j;
+      }
+    }
+    if (depth > 0) return "Unmatched ( or \\(";
+    if (/\\$/.test(src)) return "Trailing backslash";
+    return "Invalid regular expression";
+  }
+
+  function isLongMatch(str) {
+    if (str === null || str === undefined || str.length <= 15) return false;
+    return str.indexOf("|") < 0 && str.indexOf("[") < 0;
+  }
+
+  // short options: shared by both, plus pgrep's -l -a -d -v -w and pkill's
+  // -e -q.  The value says whether the option takes an argument.
+  var PG_SHORT = { L: 0, F: 1, c: 0, f: 0, i: 0, n: 0, o: 0, x: 0, P: 1,
+                   O: 1, A: 0, H: 0, g: 1, s: 1, u: 1, U: 1, G: 1, t: 1,
+                   r: 1, V: 0, h: 0, "?": 0 };
+  var PG_ONLY = { l: 0, a: 0, d: 1, v: 0, w: 0 };
+  var PK_ONLY = { e: 0, q: 1 };
+
+  // long option -> [takes an argument, the short-equivalent code]
+  var PG_LONG = {
+    signal: [1, "signal"], "ignore-ancestors": [0, "A"],
+    "require-handler": [0, "H"], count: [0, "c"], cgroup: [1, "cgroup"],
+    delimiter: [1, "d"], "list-name": [0, "l"], "list-full": [0, "a"],
+    full: [0, "f"], pgroup: [1, "g"], group: [1, "G"],
+    "ignore-case": [0, "i"], newest: [0, "n"], oldest: [0, "o"],
+    older: [1, "O"], parent: [1, "P"], session: [1, "s"],
+    terminal: [1, "t"], euid: [1, "u"], uid: [1, "U"], inverse: [0, "v"],
+    lightweight: [0, "w"], exact: [0, "x"], pidfile: [1, "F"],
+    logpidfile: [0, "L"], echo: [0, "e"], ns: [1, "ns"],
+    nslist: [1, "nslist"], queue: [1, "q"], runstates: [1, "r"],
+    env: [1, "env"], help: [0, "h"], version: [0, "V"],
+  };
+
+  var NS_NAMES = ["ipc", "mnt", "net", "pid", "user", "uts"];
+
+  function runPgrep(prog, args, stdin, sh) {
+    var res;
+    try { res = pgrepBody(prog, args, sh); }
+    catch (x) { if (!x || !x.pg) throw x; res = x.pg; }
+    if (res.err) sh._error(res.err.replace(/\n$/, ""));
+    return { out: res.out, code: res.code };
+  }
+
+  function pgrepBody(prog, args, sh) {
+    var isKill = prog === "pkill";
+    var o = {
+      count: 0, delim: "\n", long: 0, longlong: 0, negate: 0, exact: 0,
+      threads: 0, newest: 0, oldest: 0, older: -1, full: 0, ignoreCase: 0,
+      echo: 0, signal: 15, queue: -1, pattern: null, pgrp: null, rgid: null,
+      pids: null, ppid: null, sid: null, term: null, euid: null, ruid: null,
+      runstates: null, ignoreAncestors: 0, lock: 0, pidfile: null,
+      cgroup: null, env: null, requireHandler: 0,
+    };
+    var criteria = 0, rest = [], errBuf = "";
+
+    function pg(out, err, code) { return { pg: { out: out, err: err, code: code } }; }
+    // xwarnx()/xerrx(): the message, the program's name, no usage text.
+    function fail(msg, code) {
+      throw pg("", prog + ": " + msg + "\n", code === undefined ? 2 : code);
+    }
+    // usage('?') on its own, and getopt's message plus usage('?').
+    function usageErr() { throw pg("", usageBody(prog), 2); }
+    function optFail(msg) {
+      throw pg("", prog + ": " + msg + "\n" + usageBody(prog), 2);
+    }
+    function usageOk() { throw pg(usageBody(prog), "", 0); }
+
+    function convNum(s) {
+      var r = strictAtol(s);
+      if (!r.ok) fail("not a number: " + s);
+      return r.n;
+    }
+    function convUid(s) {
+      var r = strictAtol(s);
+      if (r.ok) return r.n;
+      var u = lookupId("/etc/passwd", s, 2);
+      if (u === null || isNaN(u)) fail("invalid user name: " + s);
+      return u;
+    }
+    function convGid(s) {
+      var r = strictAtol(s);
+      if (r.ok) return r.n;
+      var g = lookupId("/etc/group", s, 2);
+      if (g === null || isNaN(g)) fail("invalid group name: " + s);
+      return g;
+    }
+    function convPgrp(s) {
+      var r = strictAtol(s);
+      if (!r.ok) fail("invalid process group: " + s);
+      if (r.n !== 0) return r.n;
+      var e = sh && sh.pid ? P.get(sh.pid) : null;
+      return e ? P.pgid(e) : (sh && sh.pid) || 0;
+    }
+    function convSid(s) {
+      var r = strictAtol(s);
+      if (!r.ok) fail("invalid session id: " + s);
+      if (r.n !== 0) return r.n;
+      var e = sh && sh.pid ? P.get(sh.pid) : null;
+      return e ? P.sid(e) : (sh && sh.pid) || 0;
+    }
+    // split_list(): an empty list is not a list, and a member that will not
+    // convert has already said so and left.
+    function splitList(str, conv) {
+      if (str === "") return null;
+      var parts = str.split(","), out = [], i;
+      for (i = 0; i < parts.length; i++) out.push(conv(parts[i]));
+      return out.length ? out : null;
+    }
+    function needList(value, conv, code) {
+      var l = splitList(value, conv);
+      if (l === null) usageErr();
+      return l;
+    }
+
+    function setOpt(ch, val) {
+      var n;
+      switch (ch) {
+        case "h": usageOk();
+        case "V": throw pg((VER[prog] || []).join("\n") + "\n", "", 0);
+        case "c": o.count = 1; return;
+        case "f": o.full = 1; return;
+        case "x": o.exact = 1; return;
+        case "w": o.threads = 1; return;
+        case "e": o.echo = 1; return;
+        case "q": o.queue = parseInt(val, 10); return;
+        case "l": o.long = 1; return;
+        case "a": o.longlong = 1; return;
+        case "d": o.delim = val; return;
+        case "A": o.ignoreAncestors = 1; return;
+        case "H": o.requireHandler = 1; criteria++; return;
+        case "L": o.lock++; return;
+        case "F": o.pidfile = val; criteria++; return;
+        case "O": o.older = parseInt(val, 10); criteria++; return;
+        case "r": o.runstates = val; criteria++; return;
+        case "n":
+          if (o.oldest || o.negate || o.newest) usageErr();
+          o.newest = 1; criteria++; return;
+        case "o":
+          if (o.oldest || o.negate || o.newest) usageErr();
+          o.oldest = 1; criteria++; return;
+        case "v":
+          if (o.oldest || o.negate || o.newest) usageErr();
+          o.negate = 1; return;
+        case "i":
+          if (o.ignoreCase) usageOk();
+          o.ignoreCase = "i"; return;
+        case "P": o.ppid = needList(val, convNum); criteria++; return;
+        case "g": o.pgrp = needList(val, convPgrp); criteria++; return;
+        case "s": o.sid = needList(val, convSid); criteria++; return;
+        case "t": o.term = needList(val, function (s) { return s; }); criteria++; return;
+        case "u": o.euid = needList(val, convUid); criteria++; return;
+        case "U": o.ruid = needList(val, convUid); criteria++; return;
+        case "G": o.rgid = needList(val, convGid); criteria++; return;
+        case "cgroup": o.cgroup = needList(val, function (s) { return s; }); criteria++; return;
+        case "env": o.env = needList(val, function (s) { return s; }); criteria++; return;
+        case "signal":
+          n = P.signalNumber(val);
+          if (n === null) {
+            if (/^[0-9]/.test(val)) n = parseInt(val, 10);
+            else throw pg("", 'Unknown signal "' + val + '".' + usageBody(prog), 2);
+          }
+          o.signal = n; return;
+        case "ns":
+          if ((parseInt(val, 10) || 0) === 0) { o.runstates = val; criteria++; return; }
+          /* not a number: the C falls into the --nslist handler below */
+          /* falls through */
+        case "nslist":
+          if (NS_NAMES.indexOf(val) < 0) throw pg("", "", 2);
+          return;
+        default: optFail("invalid option -- '" + ch + "'");
+      }
+    }
+
+    // pkill reads its signal as a bare -<sig> anywhere on the line, before
+    // getopt ever gets to look at it.
+    if (isKill) {
+      for (var k = 0; k < args.length; k++) {
+        if (args[k].charAt(0) === "-") {
+          var sg = P.signalNumber(args[k].slice(1));
+          if (sg !== null) {
+            o.signal = sg;
+            args = args.slice(0, k).concat(args.slice(k + 1));
+            break;
+          }
+        }
+      }
+    }
+
+    var table = {}, key;
+    for (key in PG_SHORT) table[key] = PG_SHORT[key];
+    var extra = isKill ? PK_ONLY : PG_ONLY;
+    for (key in extra) table[key] = extra[key];
+
+    var i = 0, a, j, pos, ch, v, body, eq, name, entry;
+    while (i < args.length) {
+      a = args[i];
+      if (a === "--") { rest = rest.concat(args.slice(i + 1)); break; }
+      if (a.slice(0, 2) === "--") {
+        body = a.slice(2); eq = -1;
+        for (j = 0; j < body.length; j++)
+          if (body.charAt(j) === "=" || body.charAt(j) === ":") { eq = j; break; }
+        name = eq >= 0 ? body.slice(0, eq) : body;
+        if (!Object.prototype.hasOwnProperty.call(PG_LONG, name))
+          optFail("unrecognized option '--" + name + "'");
+        entry = PG_LONG[name];
+        v = eq >= 0 ? body.slice(eq + 1) : null;
+        if (entry[0]) {
+          if (v === null || v === "") {
+            if (i + 1 < args.length && args[i + 1] !== "") v = args[++i];
+            else optFail("option '--" + name + "' requires an argument");
+          }
+        } else if (v !== null) {
+          optFail("option '--" + name + "' doesn't allow an argument");
+        }
+        setOpt(entry[1], v);
+        i++;
+        continue;
+      }
+      if (a.length > 1 && a.charAt(0) === "-") {
+        pos = 1;
+        while (pos < a.length) {
+          ch = a.charAt(pos);
+          if (!Object.prototype.hasOwnProperty.call(table, ch))
+            optFail("invalid option -- '" + ch + "'");
+          pos++;
+          v = null;
+          if (table[ch]) {
+            if (pos < a.length) { v = a.slice(pos); pos = a.length; }
+            else if (i + 1 < args.length) v = args[++i];
+            else optFail("option requires an argument -- '" + ch + "'");
+          }
+          setOpt(ch, v);
+        }
+        i++;
+        continue;
+      }
+      rest.push(a);
+      i++;
+    }
+
+    if (o.lock && !o.pidfile)
+      fail("-L without -F makes no sense\nTry `" + prog + " --help' for more information.");
+    if (o.pidfile) {
+      var pf = V.readFile(o.pidfile);
+      var nums = pf === null ? [] : pf.split(/\s+/)
+        .filter(function (s) { return s !== ""; })
+        .map(function (s) { var r = strictAtol(s); return r.ok ? r.n : null; })
+        .filter(function (n) { return n !== null; });
+      if (!nums.length)
+        fail("pidfile not valid\nTry `" + prog + " --help' for more information.", 1);
+      o.pids = nums;
+    }
+    if (rest.length === 1) o.pattern = rest[0];
+    else if (rest.length > 1)
+      fail("only one pattern can be provided\nTry `" + prog + " --help' for more information.");
+    else if (criteria === 0)
+      fail("no matching criteria specified\nTry `" + prog + " --help' for more information.");
+
+    // ---- select_procs() ----------------------------------------------------
+    var re = null;
+    if (o.pattern !== null) {
+      var src = o.exact ? "^(" + o.pattern + ")$" : o.pattern;
+      try { re = LW.ere(src, o.ignoreCase ? "i" : "", true); }
+      catch (e0) { fail("regex error: " + regexErrText(o.pattern)); }
+    }
+
+    function inList(value, list) {
+      if (!list) return true;
+      for (var q = 0; q < list.length; q++) if (list[q] === value) return true;
+      return false;
+    }
+    function cgroupPath(e) {
+      var t = P.cgroupText(e) || "";
+      return t.slice(0, 3) === "0::" ? t.slice(3) : null;
+    }
+    function envMatches(e, list) {
+      var env = e.env;
+      if (!env) return false;
+      for (var q = 0; q < list.length; q++) {
+        for (var w = 0; w < env.length; w++) {
+          if (list[q].indexOf("=") < 0) {
+            if (env[w].slice(0, list[q].length) === list[q]) return true;
+          } else if (env[w] === list[q]) return true;
+        }
+      }
+      return false;
+    }
+    // Every process in this world was installed with the same signal masks,
+    // so -H asks the one question it can: does the caught mask have the bit?
+    function handlerFor(sig) {
+      var mask = P.SIGMASKS && P.SIGMASKS.cgt;
+      if (!mask || sig < 1) return false;
+      var b = sig - 1;
+      var digit = mask.charAt(mask.length - 1 - Math.floor(b / 4));
+      if (!digit) return false;
+      return (parseInt(digit, 16) & (1 << (b % 4))) !== 0;
+    }
+    function ancestorsOf(pid) {
+      var set = {}, n = 0, e;
+      while (pid && n++ < 128) {
+        set[pid] = 1;
+        e = P.get(pid);
+        if (!e) break;
+        pid = e.ppid;
+      }
+      return set;
+    }
+
+    var anc = o.ignoreAncestors ? ancestorsOf(sh && sh._cmdPid) : null;
+    var me = (sh && sh._cmdPid) || 0;
+    var all = P.list(), hits = [], e, match;
+    for (i = 0; i < all.length; i++) {
+      e = all[i];
+      if (e.pid === me) continue;
+      if (anc && anc[e.pid]) continue;
+      match = true;
+      if (o.ppid && !inList(e.ppid, o.ppid)) match = false;
+      else if (o.pids && !inList(e.pid, o.pids)) match = false;
+      else if (o.pgrp && !inList(P.pgid(e), o.pgrp)) match = false;
+      else if (o.euid && !inList(e.uid, o.euid)) match = false;
+      else if (o.ruid && !inList(e.uid, o.ruid)) match = false;
+      else if (o.rgid && !inList(P.gid(e), o.rgid)) match = false;
+      else if (o.sid && !inList(P.sid(e), o.sid)) match = false;
+      else if (o.older >= 0 &&
+               Math.max(0, (LW.uptime ? LW.uptime() : 0) - e.since) < o.older)
+        match = false;
+      else if (o.term && !inList(e.tty, o.term)) match = false;
+      else if (o.runstates &&
+               o.runstates.indexOf((e.zombie ? "Z" : (e.stat || "S").charAt(0))) < 0)
+        match = false;
+      else if (o.cgroup && o.cgroup.indexOf(cgroupPath(e)) < 0) match = false;
+      else if (o.env && !envMatches(e, o.env)) match = false;
+      else if (o.requireHandler && !handlerFor(o.signal)) match = false;
+      if (match && o.pattern) {
+        var hay = o.full ? (e.args || "") : (e.comm || "");
+        if (!re.test(hay)) match = false;
+      }
+      if (match !== !!o.negate) hits.push(e);
+    }
+
+    // -n and -o each leave exactly one process: the newest or the oldest,
+    // ties broken by the lower pid.
+    if (o.newest || o.oldest) {
+      hits.sort(function (x, y) { return (x.since - y.since) || (x.pid - y.pid); });
+      hits = hits.length ? [o.newest ? hits[hits.length - 1] : hits[0]] : [];
+    }
+
+    if (!hits.length && !o.full && isLongMatch(o.pattern)) {
+      errBuf += prog +
+        ": pattern that searches for process name longer than 15 characters" +
+        " will result in zero matches\nTry `" + prog +
+        " -f' option to match against the complete command line.\n";
+    }
+
+    // ---- the output --------------------------------------------------------
+    if (isKill) {
+      var outBuf = "", killed = 0, uid = myUid(sh);
+      for (i = 0; i < hits.length; i++) {
+        e = hits[i];
+        // EPERM unless we own it or are root; ESRCH (gone already) is not
+        // a failure at all.
+        if (!(e.uid === 0 && uid !== 0) && P.kill(e.pid, o.signal)) {
+          if (o.echo)
+            outBuf += (o.longlong ? (e.args || "") : (e.comm || "")) +
+                      " killed (pid " + e.pid + ")\n";
+          killed++;
+          continue;
+        }
+        if (!P.get(e.pid) || e.zombie) continue;
+        errBuf += prog + ": killing pid " + e.pid + " failed\n";
+      }
+      if (o.count) outBuf += hits.length + "\n";
+      return { out: outBuf, err: errBuf, code: killed ? 0 : 1 };
+    }
+
+    var out;
+    if (o.count) out = hits.length + "\n";
+    else if (o.long || o.longlong) {
+      var strs = hits.map(function (x) {
+        return x.pid + " " + (o.longlong ? (x.args || "") : (x.comm || ""));
+      });
+      out = strs.length ? strs.join(o.delim) + "\n" : "";
+    } else {
+      var nums2 = hits.map(function (x) { return String(x.pid); });
+      out = nums2.length ? nums2.join(o.delim) + "\n" : "";
+    }
+    return { out: out, err: errBuf, code: hits.length ? 0 : 1 };
+  }
+
+  // ---- pidof ---------------------------------------------------------------
+  //
+  // sysvinit's pidof(1) (the host's /usr/bin/pidof is a link to killall5).
+  // A program name is matched against the name the process was started with
+  // and against the binary it is running; a name given as a path is matched
+  // as a path, so ./bash is not /usr/bin/bash.  Anything getopt dislikes is
+  // silently a failure: no message, exit 1.
+
+  function baseOf(p) { var i = String(p).lastIndexOf("/"); return i < 0 ? String(p) : String(p).slice(i + 1); }
+  function dirOf(p) { var i = String(p).lastIndexOf("/"); return i <= 0 ? "/" : String(p).slice(0, i); }
+
+  function normPath(p) {
+    var abs = p.charAt(0) === "/", parts = p.split("/"), out = [], x;
+    for (var i = 0; i < parts.length; i++) {
+      x = parts[i];
+      if (x === "" || x === ".") continue;
+      if (x === "..") out.pop();
+      else out.push(x);
+    }
+    return (abs ? "/" : "") + out.join("/");
+  }
+
+  var PATH_ALIAS = { "/bin": "/usr/bin", "/usr/bin": "/bin",
+                     "/sbin": "/usr/sbin", "/usr/sbin": "/sbin" };
+
+  function sameFile(a, b) {
+    if (!b) return false;
+    a = normPath(a); b = normPath(b);
+    if (a === b) return true;
+    var da = dirOf(a), db = dirOf(b);
+    return !!PATH_ALIAS[da] && PATH_ALIAS[da] === db && baseOf(a) === baseOf(b);
+  }
+
+  function runPidof(args, stdin, sh) {
+    var sep = " ", quiet = 0, one = 0, withX = 0, zombies = 0, omit = [], names = [];
+    var i = 0, p, ch, v;
+    while (i < args.length) {
+      var a = args[i++];
+      if (a === "--") { names = names.concat(args.slice(i)); break; }
+      if (a.length > 1 && a.charAt(0) === "-") {
+        for (p = 1; p < a.length; p++) {
+          ch = a.charAt(p);
+          if (ch === "h") return { out: (HELP.pidof || []).join("\n") + "\n", code: 0 };
+          if (ch === "c" || ch === "n") continue;
+          if (ch === "q") { quiet = 1; continue; }
+          if (ch === "s") { one = 1; continue; }
+          if (ch === "x") { withX = 1; continue; }
+          if (ch === "z") { zombies = 1; continue; }
+          if (ch === "d" || ch === "o") {
+            if (p + 1 < a.length) { v = a.slice(p + 1); p = a.length; }
+            else if (i < args.length) v = args[i++];
+            else return { out: "", code: 1 };
+            if (ch === "d") sep = v;
+            else {
+              var n = strictAtol(v);
+              if (!n.ok) return { out: "", code: 1 };
+              omit.push(n.n);
+            }
+            continue;
+          }
+          return { out: "", code: 1 };       // getopt says nothing, pidof says less
+        }
+        continue;
+      }
+      names.push(a);
+    }
+    if (!names.length) return { out: "", code: 1 };
+
+    var prog = names[0], me = (sh && sh._cmdPid) || 0;
+    var withPath = prog.indexOf("/") >= 0;
+    var want = withPath ? normPath(prog) : prog;
+    var hits = [], all = P.list();
+    for (i = 0; i < all.length; i++) {
+      var e = all[i];
+      if (e.pid === me) continue;
+      if (!zombies && (e.zombie || (e.stat || "").charAt(0) === "Z")) continue;
+      if (omit.indexOf(e.pid) >= 0) continue;
+      var argv0 = String(e.args || "").split(" ")[0];
+      var words = String(e.args || "").split(" ");
+      if (!withPath) {
+        if (baseOf(argv0) === want || baseOf(e.exe || "") === want) hits.push(e);
+        else if (withX && words.length > 1 && baseOf(words[1]) === want) hits.push(e);
+      } else if (want.charAt(0) === "/" &&
+                 (sameFile(want, e.exe) || sameFile(want, argv0))) hits.push(e);
+    }
+    hits.sort(function (x, y) { return y.pid - x.pid; });
+    if (one) hits = hits.slice(0, 1);
+    if (!hits.length) return { out: "", code: 1 };
+    if (quiet) return { out: "", code: 0 };
+    return { out: hits.map(function (e) { return e.pid; }).join(sep) + "\n", code: 0 };
+  }
+
+  def("pgrep", function (a, i2, s) { return runPgrep("pgrep", a, i2, s); },
+      "list processes matching a pattern");
+  def("pkill", function (a, i2, s) { return runPgrep("pkill", a, i2, s); },
+      "kill processes matching a pattern");
+  def("pidof", runPidof, "find the pid of a running program");
 
   // @MORE@
 })(window.LW = window.LW || {});

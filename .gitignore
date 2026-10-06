@@ -7,6 +7,7 @@ tools/.wasmbuild/
 /miku-proxy/
 /xapi-compat/
 /procps-src/
+/psmisc-src/
 
 # Editor / OS noise
 *~
