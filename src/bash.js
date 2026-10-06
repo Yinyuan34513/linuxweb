@@ -274,6 +274,9 @@
       var before = this.i;
       items.push(this.parseAndOr(stops));
       if (this.i === before) this.next();   // never stall on an unconsumed token
+      // An ampersand immediately after a command puts that command in the
+      // background -- all of it, if it is a pipeline.
+      if (this.op("&")) { this.next(); items[items.length - 1].bg = true; }
     }
     return { kind: "seq", items: items };
   };
@@ -1739,6 +1742,12 @@
     this._curErr = prevErr;
     this.lastOut = (res && res.out) || "";
     if (!silent && err) this.term.write(err);
+    // After the command's output turn: check deadlines, then announce
+    // what the job world looks like changed this turn.
+    if (!silent && this._procDepth === 0) {
+      this.jobTick();
+      this.flushNotices();
+    }
     return this.status;
   };
 
@@ -1747,7 +1756,7 @@
       case "seq": {
         var out = "", err = "";
         for (var i = 0; i < node.items.length; i++) {
-          var r = this.exec(node.items[i], stdin);
+          var r = node.items[i].bg ? this.spawnJob(node.items[i]) : this.exec(node.items[i], stdin);
           out += r.out || ""; err += r.err || "";
         }
         return { out: out, err: err };
@@ -1839,6 +1848,141 @@
     if (!/^[\s0-9+\-*/%()]+$/.test(sub)) return 0;
     try { return Function('"use strict";return(' + sub + ')')() | 0; }
     catch (e) { return 0; }
+  };
+
+  // ---------------------------------------------------------------------------
+  // Job control (IEEE 1003.1 2.6): `command &` makes a new job, `jobs` lists
+  // them, and `kill %N`, `fg`, `bg`, `wait` manage them.
+  //
+  // Sleeps carry a deadline against the wall clock so completion is discoverable
+  // by what gets said at the next command turn; everything else is judged as it
+  // happens because its simulated process is just a row that appears in /proc
+  // while the command is on screen.  Whatever shape the fate of a job takes --
+  // Done, Exit N, Stopped, Terminated -- the line that reports it is always the
+  // same band: `[N]MARK  <state padded>  <command>`.
+
+  var JOB_WORDS_SIGNAL = {
+    HUP: "Hangup", INT: "Interrupt", QUIT: "Quit", ILL: "Illegal instruction",
+    TRAP: "Trace/breakpoint trap", ABRT: "Aborted", BUS: "Bus error",
+    FPE: "Floating point exception", KILL: "Killed", SEGV: "Segmentation fault",
+    PIPE: "Broken pipe", ALRM: "Alarm clock", TERM: "Terminated",
+    STKFLT: "Stack limit exceeded", XCPU: "Cpu time limit exceeded",
+    XFSZ: "File size limit exceeded",
+  };
+
+  function jobText(node) {
+    if (!node) return "";
+    switch (node.kind) {
+      case "simple": return node.words.map(function (w) { return w.raw; }).join(" ");
+      case "pipe": return node.cmds.map(jobText).join(" | ");
+      case "andor": return jobText(node.left) + " " + node.op + " " + jobText(node.right);
+      default: return "";
+    }
+  }
+
+  // `sleep N`'s contract is seconds-late; anything else stays "Running" until
+  // the shell runs `wait` or the job is signalsled.
+  function jobSleepSeconds(node) {
+    if (node && node.kind === "pipe" && node.cmds.length === 1) return jobSleepSeconds(node.cmds[0]);
+    if (node && node.kind === "andor") return jobSleepSeconds(node.left);
+    if (node && node.kind === "simple") {
+      var t = node.words.map(function (w) { return w.raw; });
+      if (t.length >= 2 && t[0] === "sleep") {
+        var n = parseFloat(t[1]);
+        if (!isNaN(n) && n >= 0) return n;
+      }
+    }
+    return null;
+  }
+
+  // The state word in the jobs layout, exactly the way bash says it.
+  function jobStateWord(job) {
+    switch (job.state) {
+      case "done":
+        return job.status === 0 ? "Done" : "Exit " + job.status;
+      case "stopped": return "Stopped";
+      case "killed": return JOB_WORDS_SIGNAL[job.signame] || "Terminated";
+      default: return "Running";
+    }
+  }
+
+  // The label of a job in `jobs` and in notices: `+` is the one `fg` would
+  // draw, `-` the one before it.
+  Shell.prototype._jobMarkOf = function (job) {
+    if (job === this._jobCurrent) return "+";
+    if (job === this._jobPrev) return "-";
+    return " ";
+  };
+
+  Shell.prototype._formatJobLine = function (job, withPid) {
+    var mark = this._jobMarkOf(job);
+    var prefix = "[" + job.no + "]" + (mark === " " ? "  " : mark + " ");
+    var state = jobStateWord(job).padEnd(24);
+    var cmd = job.text + (job.state === "running" ? " &" : "");
+    // (GNU's probe line: `[1]+  Running                 sleep 100 &`)
+    if (withPid) return prefix + job.pid + " " + state + cmd;
+    return prefix + " " + state + cmd;
+  };
+
+  // What we print right at the end of the command that delivered the last
+  // interesting change: the same band the table uses.
+  Shell.prototype.spawnJob = function (node) {
+    var no = 1;
+    while (this.jobs.some(function (j) { return j.no === no; })) no++;
+    var text = jobText(node);
+    var seconds = jobSleepSeconds(node);
+    var me = this.pid && LW.proc && LW.proc.get ? LW.proc.get(this.pid) : null;
+    var comm = text.split(/\s*\|\s*|\s+/)[0].split("/").pop();
+    var job = { no: no, text: text, state: "running", status: 0, since: 0,
+                seconds: seconds,
+                dueAt: seconds === null ? null : Date.now() + seconds * 1000,
+                pid: 0, notified: false, signame: "" };
+    var e = null;
+    if (LW.proc && LW.proc.spawn) {
+      e = LW.proc.spawn({ comm: comm, args: text, uid: me ? me.uid : 1000,
+        user: me ? me.user : "linuxweb", tty: me ? me.tty : "?",
+        cwd: this.cwd, stat: "S", ppid: this.pid });
+      e.pgid = e.pid; e.sid = me && me.sid !== undefined ? me.sid : e.pid;
+      job.pid = e.pid;
+    }
+    this._jobPrev = this._jobCurrent;
+    this._jobCurrent = job;
+    this.jobs.push(job);
+    this.status = 0;
+    return { out: "[" + no + "] " + job.pid + "\n", err: "" };
+  };
+
+  // Time check + detach: what changes at the end of each command and again
+  // just before waiting ever does.  "Done" jobs get an immediate second
+  // state fix ('Z') on the proc entry via exitProcess's exit, then reap.
+  Shell.prototype.jobTick = function () {
+    for (var i = 0; i < this.jobs.length; i++) {
+      var j = this.jobs[i];
+      if (j.state !== "running" || j.dueAt === null) continue;
+      if (j.dueAt <= Date.now()) {
+        j.state = "done"; j.status = 0;
+        j.notified = false;
+        _reapJob(this, j);
+      }
+    }
+  };
+
+  function _reapJob(sh, job) {
+    if (job.pid && LW.proc && LW.proc.get) {
+      var e = LW.proc.get(job.pid);
+      if (e) { LW.proc.exit && LW.proc.exit(e.pid, job.status || 0); LW.proc.reap(); }
+    }
+  }
+
+  // Every murder-or-exition prints here: the same band the jobs table prints,
+  // and bash holds it until the turn so it lands right before the next prompt.
+  Shell.prototype.flushNotices = function () {
+    for (var i = 0; i < this.jobs.length; i++) {
+      var j = this.jobs[i];
+      if (j.notified || j.state === "running") continue;
+      j.notified = true;
+      if (this.term && this.term.write) this.term.write(this._formatJobLine(j, false) + "\n");
+    }
   };
 
   Shell.prototype.execSimple = function (node, stdin) {
@@ -1959,10 +2103,10 @@
     set: "bi_set", alias: "bi_alias", unalias: "bi_unalias",
     source: "bi_source", ".": "bi_source", exit: "bi_exit", return: "bi_return",
     read: "bi_read", history: "bi_history", help: "bi_help", type: "bi_type",
-    command: "bi_command", eval: "bi_eval", umask: "bi_umask", jobs: "bi_noop",
-    wait: "bi_noop", test: "bi_test", "[": "bi_test", kill: "bi_noop",
+    command: "bi_command", eval: "bi_eval", umask: "bi_umask", jobs: "bi_jobs",
+    wait: "bi_wait", test: "bi_test", "[": "bi_test", kill: "bi_kill",
     shift: "bi_noop", let: "bi_let", exec: "bi_noop", trap: "bi_noop",
-    hash: "bi_noop", bg: "bi_noop", fg: "bi_noop", suspend: "bi_noop",
+    hash: "bi_noop", bg: "bi_bg", fg: "bi_fg", suspend: "bi_noop",
     times: "bi_noop", local: "bi_noop", declare: "bi_noop", typeset: "bi_noop",
     readonly: "bi_noop", shopt: "bi_noop", ulimit: "bi_noop", clear: "bi_clear",
     reset: "bi_reset", logout: "bi_exit", sync: "bi_sync", bind: "bi_bind",
@@ -2285,6 +2429,353 @@
   };
   Shell.prototype.bi_umask = function () { return { out: "0022\n", code: 0 }; };
   Shell.prototype.bi_noop = function () { return { out: "", code: 0 }; };
+
+  // `jobs` [-lnprs] [jobspec...]: list our table.  -l draws the pid next to
+  // the marker; -p drops the state word; a dead entry is shown only once and
+  // is forgotten in the same goodbye-ish way bash forgets its terminated rows.
+  Shell.prototype.bi_jobs = function (args) {
+    var listPid = args.indexOf("-l") >= 0, onlyPid = args.indexOf("-p") >= 0,
+        runningOnly = args.indexOf("-r") >= 0, stoppedOnly = args.indexOf("-s") >= 0,
+        unknown = args.filter(function (a) {
+          return a.charAt(0) === "-" && !/^-[lnprs]+$/.test(a);
+        });
+    if (unknown.length) {
+      this._error("bash: jobs: " + unknown[0].charAt(1) + ": invalid option\n" +
+        "jobs: usage: jobs [-lnprs] [jobspec ...] or jobs -x command [args]");
+      return { out: "", code: 2 };
+    }
+    var specs = args.filter(function (a) { return a.charAt(0) !== "-"; });
+    var rows = [];
+    for (var i = 0; i < this.jobs.length; i++) {
+      var j = this.jobs[i];
+      if (runningOnly && j.state !== "running") continue;
+      if (stoppedOnly && j.state !== "stopped") continue;
+      if (specs.length) {
+        var sel = this._matchJob(specs[0]);
+        if (specs.indexOf("%" + j.no) >= 0 || specs.indexOf("%+") >= 0 && j === this._jobCurrent) {
+          // matched explicitly below
+        }
+      }
+      rows.push(j);
+    }
+    if (specs.length) rows = rows.filter(this._jobSpecFilter(specs));
+    var out = "";
+    rows.forEach(function (j) {
+      // A death is only announced once through the empty jobs run... unless
+      // there were no commands around to flush.
+      if (j.state !== "running" && j.state !== "stopped" && j.notified) return;
+      if (onlyPid) { out += j.pid + "\n"; }
+      else if (listPid) { out += this._formatJobLine(j, true) + "\n"; }
+      else { out += this._formatJobLine(j, false) + "\n"; }
+    }, this);
+    // Items that reached "notified" by a plain run hold no longer place.
+    this.jobs = this.jobs.filter(function (j) {
+      return !(j.state !== "running" && j.state !== "stopped" && j.notified);
+    });
+    return { out: out, code: 0 };
+  };
+
+  // Job specification: %n  | %+ | %-| %% | % | %<prefix>
+  Shell.prototype._matchJob = function (spec) {
+    if (spec === undefined || spec === null) return null;
+    var s = String(spec);
+    if (s === "%" || s === "%%" || s === "%+") return this._jobCurrent;
+    if (s === "%-") return this._jobPrev;
+    var m = /^%(\d+)$/.exec(s);
+    if (m) {
+      var no = parseInt(m[1], 10);
+      for (var i = 0; i < this.jobs.length; i++) if (this.jobs[i].no === no) return this.jobs[i];
+      return null;
+    }
+    if (s.charAt(0) === "%") {
+      var needle = s.slice(1);
+      for (var k = this.jobs.length - 1; k >= 0; k--) {
+        if (this.jobs[k].text.indexOf(needle) >= 0) return this.jobs[k];
+      }
+      return null;
+    }
+    return null;
+  };
+
+  Shell.prototype._jobSpecFilter = function (specs) {
+    var sh = this;
+    return function (j) {
+      for (var i = 0; i < specs.length; i++) {
+        if (sh._matchJob(specs[i]) === j) return true;
+      }
+      return false;
+    };
+  };
+
+  // `wait [-n] [id ...]` fast-forwards the table: jobs that were still merely
+  // running are marked Done, the count of exit statuses ends with the last.
+  Shell.prototype.bi_wait = function (args) {
+    var codes = [];
+    var targets = [];
+    var unknown = false;
+    for (var i = 0; i < args.length; i++) {
+      var a = args[i];
+      if (a === "-n") { return { out: "", code: 127 }; }
+      if (a.charAt(0) === "-") { this._error("bash: wait: " + a.charAt(1) + ": invalid option"); return { out: "", code: 2 }; }
+      targets.push(a);
+    }
+    if (!targets.length) { targets = this.jobs.map(function () { return "%"; }); }
+    var seen = [];
+    for (var k = 0; k < targets.length; k++) {
+      var t = targets[k], found = null, jobNo = NaN;
+      if (/^%\d+$/.test(t)) found = this._matchJob(t);
+      else if (t.charAt(0) === "%") found = this._matchJob(t);
+      else if (/^\d+$/.test(t)) {
+        var pid = parseInt(t, 10);
+        for (var x = 0; x < this.jobs.length; x++) if (this.jobs[x].pid === pid) { found = this.jobs[x]; break; }
+        if (!found) {
+          if (LW.proc && LW.proc.get(pid)) {
+            // It is someone else's pid.
+            this._error("bash: wait: pid " + t + " is not a child of this shell");
+            unknown = true; continue;
+          }
+          this._error("bash: wait: pid " + t + " is not a child of this shell");
+          unknown = true; continue;
+        }
+      } else {
+        this._error("bash: wait: " + t + ": invalid argument");
+        unknown = true; continue;
+      }
+      if (!found) {
+        this._error("bash: wait: " + (t.charAt(0) === "%" ? t : "pid " + t + ": no such job") === t ? t : (t.charAt(0) === "%" ? t : "pid " + t).replace(/^/, "") + " is not a child of this shell");
+        if (t.charAt(0) !== "%") this._error("bash: wait: pid " + t + " is not a child of this shell");
+        else this._error("bash: wait: " + t + ": no such job");
+        unknown = true; continue;
+      }
+      seen.push(found);
+    }
+    for (var m = 0; m < seen.length; m++) {
+      var job = seen[m];
+      if (job.state === "running") {
+        job.state = "done"; job.status = 0;
+        _reapJob(this, job);
+      }
+      codes.push(jobStateWord(job) === "Done" ? 0 : job.status || 0);
+    }
+    for (var n = 0; n < this.jobs.length; n++) this.jobs[n].notified = true;
+    this.status = unknown ? 1 : (codes.length ? (codes[codes.length - 1] === 0 ? 0 : codes[codes.length - 1]) : 0);
+    this.jobs = this.jobs.filter(function (j) { return j.state === "running" || j.state === "stopped"; });
+    this._jobCurrent = null; this._jobPrev = null;
+    if (this.jobs.length) { this._jobCurrent = this.jobs[this.jobs.length - 1]; if (this.jobs.length > 1) this._jobPrev = this.jobs[this.jobs.length - 2]; }
+    return { out: "", code: this.status };
+  };
+
+  // `fg %n` runs the job's command text afresh in the foreground: it is over
+  // right away, because the fiction has no scheduler.  The line of the job is
+  // echoed in the tty-text first, as bash re-prints it.
+  Shell.prototype.bi_fg = function (args) {
+    if (args.length > 1) { this._error("bash: fg: too many arguments"); return { out: "", code: 1 }; }
+    var job = args.length ? this._matchJob(args[0]) || this._matchJobByPid(args[0]) : this._jobCurrent;
+    if (!job) {
+      this._error("bash: fg: " + (args[0] || "current") + ": no such job");
+      return { out: "", code: 1 };
+    }
+    if (job.state === "done" || job.state === "killed") {
+      // The leftover cadre is reported already.
+      this.jobs.splice(this.jobs.indexOf(job), 1);
+      this._error("bash: fg: job has terminated");
+      return { out: "", code: 1 };
+    }
+    // Bring it to the terminal and reap it with no suspended state: the sleeper's
+    // deadline is involuntarily waited over.
+    job.state = job.dueAt !== null ? (function (t, due) {
+      t.state = "done"; t.status = 0; return t;
+    })(job).state : "done";
+    job.status = 0;
+    job.notified = false;
+    _reapJob(this, job);
+    this.status = 0;
+    var out = job.text + "\n";
+    return { out: out, code: 0 };
+  };
+
+  Shell.prototype._matchJobByPid = function (pid) {
+    if (!/^\d+$/.test(pid)) return null;
+    var want = parseInt(pid, 10);
+    for (var i = 0; i < this.jobs.length; i++) if (this.jobs[i].pid === want) return this.jobs[i];
+    return null;
+  };
+
+  // `bg [%N]` revives a stopped job; it is saved as the job marked "+", its
+  // resumption gets printed "[N]+ EXPR &" on the turn.
+  Shell.prototype.bi_bg = function (args) {
+    var job = args.length ? this._matchJob(args[0]) || this._matchJobByPid(args[0]) : this._jobCurrent;
+    if (args.length && !job) {
+      this._error("bash: bg: " + args[0] + ": no such job");
+      return { out: "", code: 1 };
+    }
+    if (!job) { this._error("bash: bg: current: no such job"); return { out: "", code: 1 }; }
+    if (job.state === "running") {
+      this._error("bash: bg: job " + job.no + " already in background");
+      return { out: "", code: 1 };
+    }
+    if (job.state === "done" || job.state === "killed") {
+      this._error("bash: bg: job " + job.no + " has terminated");
+      return { out: "", code: 1 };
+    }
+    job.state = "running";
+    // Restore the rest of the sleep from when  it was stopped.
+    if (job.seconds !== undefined && job.seconds !== null) job.dueAt = Date.now() + job.seconds * 1000;
+    job.notified = false;
+    this._jobPrev = this._jobCurrent;
+    this._jobCurrent = job;
+    this.jobs.forEach(function (j) { if (j.state === "done" || j.state === "killed") j.notified = true; });
+    this.status = 0;
+    return { out: "[" + job.no + "]" + this._jobMarkOf(job) + " " + job.text + " &\n", code: 0 };
+  };
+
+  // `kill [-s sigspec | -n signum | -sigspec] pid|jobspec... | -[SIG]l ...`
+  Shell.prototype.bi_kill = function (args) {
+    if (!args.length) {
+      this._error("kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]");
+      return { out: "", code: 2 };
+    }
+    var list = false, sig = 15, targets = [];
+    for (var i = 0; i < args.length; i++) {
+      var a = args[i];
+      if (a === "-l") { list = true; continue; }
+      if (a === "-L") { list = true; continue; }
+      if (a === "-s") {
+        if (i + 1 >= args.length) { this._error("bash: kill: option requires an argument -- 's'"); return { out: "", code: 1 }; }
+        if (!job_set_signal(args[++i])) { this._error("bash: kill: " + args[i] + ": invalid signal specification"); return { out: "", code: 1 }; }
+        sig = signalOf(args[i]); continue;
+      }
+      if (a === "-n") {
+        if (i + 1 >= args.length) { this._error("bash: kill: option requires an argument -- 'n'"); return { out: "", code: 1 }; }
+        sig = signalOf(args[++i]); if (sig === null) { this._error("bash: kill: " + args[i] + ": invalid signal specification"); return { out: "", code: 1 }; }
+        continue;
+      }
+      if (a.charAt(0) === "-" && a.length > 1) {
+        var w = a.slice(1);
+        var named = signalOf(w);
+        if (named !== null) { sig = named; continue; }
+        if (list || /^\d+$/.test(w)) { list = true; targets.push(w); continue; }
+        this._error("bash: kill: " + w + ": invalid signal specification");
+        return { out: "", code: 1 };
+      }
+      if (list) targets.push(a); else targets.push(a);
+    }
+    if (list) {
+      if (!targets.length) return { out: _killLongListing(), code: 0 };
+      var out = "";
+      for (var t = 0; t < targets.length; t++) {
+        var word = targets[t];
+        if (/^\d+$/.test(word)) {
+          var n = parseInt(word, 10);
+          var name = _killNumberName(n);
+          if (name === null) {
+            if (n === 32 || n === 33) continue;   // no such signal, like bash
+            this._error("bash: kill: " + n + ": invalid signal specification");
+            return { out: "", code: 1 };
+          }
+          out += name + "\n";
+        } else {
+          var num = signalOf(word);
+          if (num === null) { this._error("bash: kill: " + word + ": invalid signal specification"); return { out: "", code: 1 }; }
+          out += num + "\n";
+        }
+      }
+      return { out: out, code: 0 };
+    }
+    if (!targets.length) {
+      this._error("kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]");
+      return { out: "", code: 2 };
+    }
+    var bad = false;
+    for (var u = 0; u < targets.length; u++) {
+      var arg = targets[u];
+      var job = null;
+      if (arg.charAt(0) === "%") job = this._matchJob(arg);
+      else if (/^\d+$/.test(arg)) {
+        for (var j = 0; j < this.jobs.length; j++) if (this.jobs[j].pid === parseInt(arg, 10)) { job = this.jobs[j]; break; }
+      } else {
+        this._error("bash: kill: " + arg + ": arguments must be process or job IDs");
+        bad = true; continue;
+      }
+      if (arg.charAt(0) === "%" && !job) {
+        this._error("bash: kill: " + arg + ": no such job");
+        bad = true; continue;
+      }
+      if (job) {
+        var sname = _killWordOfSig(sig);
+        if (sname === "STOP" || sname === "TSTP" || sname === "TTIN" || sname === "TTOU") {
+          job.state = "stopped"; job.notified = false;
+        } else if (sname === "CONT") {
+          if (job.state === "stopped") { job.state = "running"; job.notified = false; }
+        } else {
+          job.state = "killed"; job.signame = sname; job.status = 128 + sig;
+          _reapJob(this, job);
+        }
+      } else {
+        if (LW.proc && LW.proc.kill) {
+          var pidNum = parseInt(arg, 10);
+          var ok = LW.proc.kill(pidNum, sig);
+          if (!ok) { this._error("bash: kill: (" + arg + ") - No such process"); bad = true; }
+        }
+      }
+    }
+    if (this.term && this.term.write) {
+      for (var q = 0; q < this.jobs.length; q++) {
+        var jj = this.jobs[q];
+        if (!jj.notified && jj.state !== "running") {
+          jj.notified = true;
+          this.term.write(this._formatJobLine(jj, false) + "\n");
+        }
+      }
+    }
+    return { out: "", code: bad ? 1 : 0 };
+  };
+
+  function _killLongListing() {
+    function nm(n) {
+      if (n <= 31) return "SIG" + (LW.proc && LW.proc.SIGNALS ? LW.proc.SIGNALS[n] : "");
+      if (n === 34) return "SIGRTMIN";
+      if (n >= 35 && n <= 49) return "SIGRTMIN+" + (n - 34);
+      if (n >= 50 && n <= 63) return "SIGRTMAX-" + (64 - n);
+      if (n === 64) return "SIGRTMAX";
+      return "";
+    }
+    var lines = "", col = 0;
+    for (var n = 1; n <= 64; n++) {
+      if (n === 32 || n === 33) continue;
+      var cell = (n < 10 ? " " : "") + n + ") " + nm(n);
+      lines += cell + (col === 4 ? "\n" : (n === 64 ? "\n" : "\t"));
+      col = (col + 1) % 5;
+    }
+    return lines;
+  }
+
+  function _killNumberName(n) {
+    if (n === 0) return "EXIT";
+    if (n >= 1 && n <= 31) {
+      var tbl = LW.proc && LW.proc.SIGNALS;
+      return tbl ? tbl[n] : null;
+    }
+    if (n === 34) return "RTMIN";
+    if (n >= 35 && n <= 49) return "RTMIN+" + (n - 34);
+    if (n >= 50 && n <= 63) return "RTMAX-" + (64 - n);
+    if (n === 64) return "RTMAX";
+    return null;
+  }
+
+  function _killWordOfSig(num) {
+    // Mirror proc.js's SIG table's names for the JOB_WORDS_SIGNAL lookup.
+    if (LW.proc && LW.proc.signalName) return LW.proc.signalName(num);
+    return "TERM";
+  }
+
+  function signalOf(word) {
+    if (LW.proc && LW.proc.signalNumber) return LW.proc.signalNumber(word);
+    return null;
+  }
+
+  function job_set_signal(w) { return signalOf(w) !== null; }
+
   Shell.prototype.bi_clear = function () {
     this.term.clear();
     return { out: "", code: 0, cleared: true };
