@@ -1659,6 +1659,14 @@
     this.lastOut = "";
     this.running = false;
     this.isRoot = false;
+    // Job control's table, and the shell's own row in the process table:
+    // on a real machine login(1) execs bash here, which is the moment `ps`
+    // on this terminal starts seeing it.
+    this.jobs = [];
+    this._procDepth = 0;
+    if (LW.proc && LW.proc.bindShell) {
+      try { LW.proc.bindShell(this); } catch (e) { /* no process model yet */ }
+    }
   }
 
   Shell.prototype.path = function (p) {
@@ -1706,10 +1714,22 @@
     var prevErr = this._curErr;
     this._curErr = "";
     var res;
-    try { res = this.exec(ast, ""); }
+    // The shell hands the terminal to the command while it runs, which is
+    // the difference between `Ss` and `Ss+` in ps's STAT column.  Nested
+    // runLine() (a substitution, a pipe) must not take it back early.
+    var outer = this._procDepth === 0;
+    if (outer && LW.proc && LW.proc.beginCommand) LW.proc.beginCommand(this);
+    this._procDepth++;
+    try {
+      res = this.exec(ast, "");
+    }
     catch (e) {
       this._curErr = prevErr;
       throw e;
+    }
+    finally {
+      this._procDepth--;
+      if (outer && LW.proc && LW.proc.endCommand) LW.proc.endCommand(this);
     }
     // execSimple hands its stderr back in the result, so take it from there;
     // _curErr alone would be empty after the nested call reset it.
@@ -1876,6 +1896,10 @@
 
     var prevErr = this._curErr;
     this._curErr = "";
+    // A command bash does not run itself is a process for as long as it runs,
+    // so `ps` can find it while it is on the command line.
+    var proc = isExternal(this, name)
+      ? startProcess(this, name, argv.slice(1)) : null;
     var res;
     try {
       if (assigns.length) {
@@ -1889,6 +1913,7 @@
         res = this.dispatch(name, argv.slice(1), input);
       }
     } catch (e) {
+      finishProcess(proc, 1);
       this._curErr = prevErr;
       if (e && (e.__exit !== undefined || e.__return !== undefined)) throw e;
       this._error("bash: " + name + ": " + (e && e.message));
@@ -1901,6 +1926,8 @@
     this._curErr = prevErr;
     res = res || { out: "", code: 0 };
     if (res.async && res.start) {          // takes over the terminal
+      // it is still running: runAsync reaps it when the task reports done
+      this._asyncProc = proc;
       this._asyncTask = res.start;
       this.status = 0;
       // `cmd 2>&1` still merges for an async command: whatever it wrote to
@@ -1913,6 +1940,7 @@
       return { out: "", err: mergeErr ? "" : errText };
     }
     this.status = res.code === undefined ? 0 : res.code;
+    finishProcess(proc, this.status);
     var outText = res.out || "";
     if (mergeErr) { outText += errText; errText = ""; }   // 2>&1
     if (rOut) { V.writeFile(rOut, outText, rAppend); outText = ""; }
@@ -2059,6 +2087,51 @@
   // bash's failure modes for a command it cannot run.
   // Resolution order is bash's: functions, builtins, then PATH commands --
   // plus the dynamic namespace that `apt` populates.
+  // A command bash does not run itself is a process: it appears in the table
+  // for exactly as long as it runs, which is what makes `ps` find it, and is
+  // reaped the moment it exits.  Functions and builtins stay inside bash.
+  function isExternal(sh, name) {
+    if (!name) return false;
+    if (sh.functions[name]) return false;
+    if (Object.prototype.hasOwnProperty.call(BUILTIN, name)) return false;
+    if (BUI[name]) return false;
+    return !!(CMDS[name] || (LW.APT && LW.APT.cmds[name]));
+  }
+
+  function startProcess(sh, name, argv) {
+    var P = LW.proc;
+    if (!P || !P.spawn) return null;
+    var base = name.slice(name.lastIndexOf("/") + 1);
+    var e = P.spawn({
+      ppid: sh.pid || 1,
+      user: sh.env.USER || "linuxweb",
+      uid: sh.env.UID !== undefined ? parseInt(sh.env.UID, 10) : (sh.isRoot ? 0 : 1000),
+      tty: sh.tty,
+      comm: (base || "cmd").slice(0, 15),
+      args: [name].concat(argv).join(" "),
+      stat: "R",
+      fg: true,
+      cpu: 0,
+      vsz: 20480,
+      rss: 4096,
+      wchan: "0",
+      cwd: sh.cwd,
+      exe: name.indexOf("/") >= 0 ? name : "/usr/bin/" + name,
+      env: Object.keys(sh.env).sort().map(function (k) { return k + "=" + sh.env[k]; }),
+    });
+    // Every job is a process group of its own; without this the command
+    // would inherit the shell's group and `ps -o pgid` would lie.
+    if (e) e.pgid = e.pid;
+    return e;
+  }
+
+  function finishProcess(e, code) {
+    var P = LW.proc;
+    if (!P || !e) return;
+    P.exit(e.pid, code === undefined ? 0 : code);
+    P.reap();
+  }
+
   Shell.prototype.dispatch = function (name, argv, input) {
     if (this.functions[name]) return this.callFunction(name, argv, input);
     if (Object.prototype.hasOwnProperty.call(BUILTIN, name)) return this[BUILTIN[name]](argv, input);
@@ -2426,6 +2499,8 @@
         self.status = code === undefined ? 0 : code;
         self.busy = false;
         self._asyncIO = null;
+        finishProcess(self._asyncProc, self.status);
+        self._asyncProc = null;
         if (self.running) self.newPrompt();
       },
     };
@@ -2437,6 +2512,8 @@
     var io = this._asyncIO;
     if (io) { io.aborted = true; if (io.timeout) clearTimeout(io.timeout); }
     this._asyncIO = null;
+    finishProcess(this._asyncProc, 130);
+    this._asyncProc = null;
     this.busy = false;
     this.term.write("^C\n");
     this.newPrompt();
@@ -2853,6 +2930,14 @@
     this.cwd = home;
     this.env.PWD = home;
     this.isRoot = (uid === 0);
+    // The shell process was planted before we knew who was logging in; now
+    // that we do, its row has to agree with /etc/passwd.
+    if (LW.proc && LW.proc.bindShell) {
+      try {
+        var me = LW.proc.bindShell(this);
+        if (me) { me.uid = uid; me.user = user; }
+      } catch (e) { /* no process model yet */ }
+    }
     return this;
   };
 

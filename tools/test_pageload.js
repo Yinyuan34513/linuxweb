@@ -30,6 +30,20 @@ check("systemd.js loads before coreutils_sys.js",
   files.indexOf("src/systemd.js") >= 0 &&
   files.indexOf("src/systemd.js") < files.indexOf("src/coreutils_sys.js"),
   "order: " + files.join(" "));
+// ps prints the verbatim help text procps_help.js captured, and the process
+// table it reports on comes from proc.js; both have to be there first
+check("procps_help.js loads before procps.js",
+  files.indexOf("src/procps_help.js") >= 0 &&
+  files.indexOf("src/procps_help.js") < files.indexOf("src/procps.js"),
+  "order: " + files.join(" "));
+check("proc.js loads before procps.js",
+  files.indexOf("src/proc.js") >= 0 &&
+  files.indexOf("src/proc.js") < files.indexOf("src/procps.js"),
+  "order: " + files.join(" "));
+check("bash.js loads before procps.js",
+  files.indexOf("src/bash.js") >= 0 &&
+  files.indexOf("src/bash.js") < files.indexOf("src/procps.js"),
+  "order: " + files.join(" "));
 
 console.log("--- every script runs ---");
 // Enough of a browser for the sources: they need window, and the renderer needs
