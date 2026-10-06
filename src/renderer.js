@@ -278,6 +278,10 @@
     if (code === 0x0d) { this._wrapPending = false; this.col = 0; return; }   // CR
     if (code === 0x08) { this._wrapPending = false; if (this.col > 0) this.col--; return; }
     if (code === 0x09) { this._wrapPending = false; this._tabForward(1); return; }
+    // A cell holds one byte, so a character above 0xff is looked up in the
+    // font before its low byte is taken: the box-drawing lines a UTF-8
+    // program draws are in the font under their CP437 codes.
+    if (code > 0xff) code = LW.cp437(code);
     this._putGlyph(code & 0xff);
   };
 

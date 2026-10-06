@@ -530,7 +530,7 @@
   VAL.gname = function (e, S, m) {
     return S.userNum ? String(P.gid(e)) : prName(P.groupName(e), m);
   };
-  VAL.label = function (e, S, m) { return escapeStr("unconfined", m); };
+  VAL.label = function (e, S, m) { return escapeStr(P.scontext(e), m); };
 
   VAL.class = function () { return "TS"; };
   VAL.state = function (e) { return P.stat(e).charAt(0); };
@@ -612,7 +612,7 @@
   VAL.times = function (e) { return String(Math.floor(e.cpu)); };
   VAL.etime = function (e) { return P.elapsed(e, false); };
   VAL.etimes = function (e) {
-    return String(Math.max(0, Math.floor(LW.uptime() - e.since)));
+    return String(Math.max(0, Math.floor(P.uptime() - e.since)));
   };
 
   function withinDay(d) { return now().getTime() - d.getTime() < 86400000; }
@@ -2945,5 +2945,633 @@
       "kill processes matching a pattern");
   def("pidof", runPidof, "find the pid of a running program");
 
-  // @MORE@
-})(window.LW = window.LW || {});
+  // ---- pstree -------------------------------------------------------------
+  //
+  // psmisc 23.7's src/pstree.c.  read_proc() walks the process table and
+  // builds a tree of PROC nodes, add_child() orders the siblings by name (or
+  // by pid with -n), fix_orphans() hangs everything else off the root, and
+  // dump_tree() draws it: the tree-equal collapsing, the two different child
+  // loops (-a and the plain case) and out_char()'s truncation at the
+  // terminal width.
+  //
+  // Three parts of the program this machine cannot exercise, all three
+  // because of what is (not) under /proc here:
+  //
+  //   * one process, one thread -- there is no /proc/pid/task, so -t and -T
+  //     parse and do nothing, and no {name} child ever reaches the THREAD
+  //     half of the -a loop;
+  //   * no /proc/pid/ns, so -N always answers "not available" and -S never
+  //     finds a namespace to disagree about;
+  //   * kthreads hang off the pid-0 placeholder, which fix_orphans() leaves
+  //     alone, so -- exactly as in v23.7 without -k -- they show up only
+  //     under `pstree 0`.
+  var PSTREE_SYM = {
+    ascii: { empty: "  ", branch: "|-", vert: "| ", last: "`-",
+             single: "---", first: "-+-" },
+    utf: { empty: "  ", branch: "\u251c\u2500", vert: "\u2502 ",
+           last: "\u2514\u2500", single: "\u2500\u2500\u2500",
+           first: "\u2500\u252c\u2500" },
+    // VT_BEG shifts the line-drawing character set into use, VT_END shifts
+    // the normal one back.  psmisc only reaches these with -G; its automatic
+    // choice is UTF-8 or ASCII, never VT100.
+    vt100: { empty: "  ",
+             branch: "\u001b(0\u000ftq\u001b(B",
+             vert: "\u001b(0\u000fx\u001b(B ",
+             last: "\u001b(0\u000fmq\u001b(B",
+             single: "\u001b(0\u000fqqq\u001b(B",
+             first: "\u001b(0\u000fqwq\u001b(B" },
+  };
+
+  // getopt_long()'s short options exactly as main() declares them, colons
+  // and all: a colon makes the option take an argument, the rest of the word
+  // if there is any and the next word if there is not.  `?` is not on the
+  // list, which is why `pstree -?` complains.
+  var PSTREE_SHORT = "aAcC:GhH:nN:pglsStTuUVZ";
+  var PSTREE_LONG = {
+    arguments: "a", ascii: "A", "compact-not": "c", color: "C",
+    vt100: "G", "highlight-all": "h", "highlight-pid": "H", long: "l",
+    "numeric-sort": "n", "ns-sort": "N", "show-pids": "p",
+    "show-pgids": "g", "show-parents": "s", "ns-changes": "S",
+    "thread-names": "t", "hide-threads": "T", "uid-changes": "u",
+    unicode: "U", version: "V", "security-context": "Z",
+  };
+  var PSTREE_OPT = (function () {
+    var takes = {}, valid = {};
+    for (var i = 0; i < PSTREE_SHORT.length; i++) {
+      var k = PSTREE_SHORT.charAt(i);
+      if (k === ":") continue;
+      valid[k] = 1;
+      if (PSTREE_SHORT.charAt(i + 1) === ":") takes[k] = 1;
+    }
+    return { takes: takes, valid: valid };
+  })();
+  var PSTREE_NS = { cgroup: 1, ipc: 1, mnt: 1, net: 1, pid: 1,
+                    time: 1, user: 1, uts: 1 };
+
+  function runPstree(args, stdin, sh) {
+    var V = LW.VFS, P = LW.proc;
+    var T = {
+      env: (sh && sh.env) ? sh.env : {},
+      // main()'s own variables
+      printArgs: 0, compact: 1, userChange: 0, pids: 0, pgids: 0,
+      showParents: 0, byPid: 0, trunc: 1, nsChange: 0, threadNames: 0,
+      hideThreads: 0, showScontext: 0, colorAge: 0, sym: PSTREE_SYM.ascii,
+      highlight: 0, md: "", me: "", cols: 80, nsid: "",
+      // the tree and the line being drawn
+      nodes: [], out: "", err: "", curX: 1, charLen: 0, lastChar: "",
+      widths: [], mores: [], dumped: 0,
+    };
+
+    function bail(code) { throw { pstreeExit: true, code: code }; }
+    function usage() {
+      T.err += LW.PSHELP.pstreeUsage.join("\n") + "\n";
+      bail(1);
+    }
+
+    // ---- the byte-at-a-time writer ---------------------------------------
+    //
+    // out_char() charges one column for the first byte of a character and
+    // lets the rest ride along, which is how a UTF-8 tree still lines up on
+    // an 80-column screen.  `glyph` is what goes out when the byte fits --
+    // null for continuation bytes, whose glyph left with the first one --
+    // and `bytes` is that character's length in UTF-8 bytes.
+    function outChar(glyph, bytes) {
+      if (T.charLen === 0) { T.charLen = bytes; T.curX++; }
+      T.charLen--;
+      if (!T.trunc || T.curX <= T.cols) { if (glyph !== null) T.out += glyph; }
+      else if (T.curX === T.cols + 1) T.out += "+";
+    }
+    function outStr(s) {
+      for (var i = 0; i < s.length; i++) {
+        var cp = s.charCodeAt(i), glyph = s.charAt(i), bytes;
+        if (cp >= 0xd800 && cp < 0xdc00 && i + 1 < s.length) {
+          i++; glyph += s.charAt(i); bytes = 4;
+        } else if (cp >= 0x800) bytes = 3;
+        else if (cp >= 0x80) bytes = 2;
+        else bytes = 1;
+        outChar(glyph, bytes);
+        for (var b = 1; b < bytes; b++) outChar(null, 0);
+      }
+    }
+    // Non-negative integers only, and 0 comes out as nothing at all -- the
+    // returned count still says one, because psmisc's arithmetic says so.
+    function outInt(x) {
+      var digits = 0, div;
+      for (div = 1; Math.floor(x / div); div *= 10) digits++;
+      if (!digits) digits = 1;
+      for (div = Math.floor(div / 10); div; div = Math.floor(div / 10))
+        outChar(String(Math.floor(x / div) % 10), 1);
+      return digits;
+    }
+    function outNewline() {
+      // last_char is never assigned in psmisc 23.7, so the flush above it
+      // never fires; it is here because the code is.
+      if (T.lastChar && T.curX === T.cols) T.out += T.lastChar;
+      T.lastChar = "";
+      T.out += "\n";
+      T.curX = 1;
+    }
+    function utf8(s) {
+      var out = [];
+      for (var i = 0; i < s.length; i++) {
+        var cp = s.charCodeAt(i);
+        if (cp >= 0xd800 && cp < 0xdc00 && i + 1 < s.length) {
+          cp = 0x10000 + ((cp - 0xd800) << 10) + (s.charCodeAt(i + 1) - 0xdc00);
+          i++;
+        }
+        if (cp < 0x80) out.push(cp);
+        else if (cp < 0x800) out.push(0xc0 | (cp >> 6), 0x80 | (cp & 63));
+        else if (cp < 0x10000)
+          out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+        else out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63),
+                      0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+      }
+      return out;
+    }
+    // out_args(): a name, with every byte that is not printable ASCII spelled
+    // out the way C spells it -- one backslash-escape per byte -- and the
+    // count it hands back is how many columns that took.
+    function outArgs(s) {
+      var bytes = utf8(s), count = 0;
+      for (var i = 0; i < bytes.length; i++) {
+        var b = bytes[i];
+        if (b === 0x5c) { outStr("\\\\"); count += 2; }
+        else if (b >= 0x20 && b <= 0x7e) { outChar(String.fromCharCode(b), 1); count++; }
+        else { outStr("\\" + ("000" + b.toString(8)).slice(-3)); count += 4; }
+      }
+      return count;
+    }
+
+    // ---- reading the table ------------------------------------------------
+    function node(comm, pid, uid) {
+      return { comm: comm, pid: pid, uid: uid, pgid: 0, age: 0,
+               argv: null, argc: 0, flags: 0, parent: null, children: [] };
+    }
+    function findProc(pid) {
+      for (var i = 0; i < T.nodes.length; i++)
+        if (T.nodes[i].pid === pid) return T.nodes[i];
+      return null;
+    }
+    // Siblings sit in name order, or pid order with -n; on a name tie the
+    // lower uid goes first.  strcmp reads names as unsigned bytes, which for
+    // the names a process has is what JavaScript's < on strings does.
+    function addChild(parent, child) {
+      var list = parent.children, i = 0;
+      for (; i < list.length; i++) {
+        if (T.byPid) { if (list[i].pid > child.pid) break; }
+        else if (list[i].comm > child.comm) break;
+        else if (list[i].comm === child.comm && list[i].uid > child.uid) break;
+      }
+      list.splice(i, 0, child);
+      child.parent = parent;
+    }
+    // A process first met as somebody's parent arrives as a "?" and is
+    // renamed when the real one turns up; the parent's list, which was
+    // sorted for "?", then gets one pass of the same comparison.
+    function renameProc(self, comm, uid) {
+      self.comm = comm; self.uid = uid;
+      if (T.byPid || !self.parent) return;
+      var pl = self.parent.children;
+      for (var i = 0; i + 1 < pl.length; i++)
+        if (pl[i].comm > pl[i + 1].comm) {
+          var t = pl[i]; pl[i] = pl[i + 1]; pl[i + 1] = t;
+        }
+    }
+    function addProc(comm, pid, ppid, pgid, uid, argv, argc, age) {
+      var self = findProc(pid), parent;
+      if (!self) { self = node(comm, pid, uid); T.nodes.push(self); }
+      else renameProc(self, comm, uid);
+      if (argv) { self.argv = argv; self.argc = argc; }
+      if (pid === ppid) ppid = 0;
+      self.pgid = pgid;
+      self.age = age;
+      parent = findProc(ppid);
+      if (!parent) { parent = node("?", ppid, 0); T.nodes.push(parent); }
+      if (pid !== 0) addChild(parent, self);
+    }
+    // hidepid on /proc, or a parent that has already gone: everything with
+    // nobody to hang off is moved under the root, which is why a stray
+    // daemon turns up at the top level instead of vanishing.  Pid 0 is left
+    // alone, so the kernel threads stay with the placeholder and stay out of
+    // every tree but `pstree 0`.
+    function fixOrphans(rootPid) {
+      var root = findProc(rootPid);
+      if (!root) { root = node("?", rootPid, 0); T.nodes.push(root); }
+      T.nodes.slice().forEach(function (w) {
+        if (w.pid === 1 || w.pid === 0) return;
+        if (w.parent === null) addChild(root, w);
+      });
+    }
+    function readProc(rootPid) {
+      var all = P.list();
+      if (!all.length) { T.err += "/proc is empty (not mounted ?)\n"; bail(1); }
+      // psmisc reads only as much cmdline as the line it is drawing can
+      // hold: width + 1 bytes when it is going to truncate, BUFSIZ + 1 when
+      // it is not.
+      var bufSize = T.trunc ? T.cols + 1 : 8193;
+      all.forEach(function (e) {
+        // /proc/pid/cmdline: argv joined by NULs and terminated by one
+        // more, empty for a kernel thread.  set_args() reads it back by
+        // counting the NULs before the last byte -- the number of
+        // arguments -- and throws argv[0] away, which the name printed
+        // beside it already says.
+        var cmd = e.args ? e.args.replace(/ /g, "\0") + "\0" : "";
+        var argv = null, argc = -1;
+        if (T.printArgs && cmd) {
+          var buf = cmd.length >= bufSize
+            ? cmd.slice(0, bufSize - 1) + "\0" : cmd + "\0";
+          var fields = buf.split("\0");
+          argc = buf.slice(0, -1).split("\0").length - 1;
+          argv = fields.slice(1, 1 + argc);
+        }
+        addProc(e.comm, e.pid, e.ppid, P.pgid(e), e.uid, argv, argc,
+                Math.max(0, P.uptime() - e.since));
+      });
+      fixOrphans(rootPid);
+    }
+
+    // ---- drawing ----------------------------------------------------------
+    function treeEqual(a, b) {
+      if (a.comm !== b.comm) return false;
+      if (T.userChange && a.uid !== b.uid) return false;
+      // -S compares namespace inodes, and skips any that are unset; this
+      // /proc has none, so there is never a difference to find.
+      if (a.children.length !== b.children.length) return false;
+      for (var i = 0; i < a.children.length; i++)
+        if (!treeEqual(a.children[i], b.children[i])) return false;
+      return true;
+    }
+    function printColor(age) {
+      if (!T.colorAge) return;
+      outRaw(age < 60 ? "\u001b[32m" : age < 3600 ? "\u001b[33m" : "\u001b[31m");
+    }
+    function resetColor() { if (T.colorAge) outRaw("\u001b[0m"); }
+    // tputs() and the age colours both reach the terminal with a plain
+    // putchar() in psmisc: they never pass through out_char(), so unlike
+    // everything else they do not cost a column.  Routing them through
+    // out_char() would stretch every width[level] after a highlighted or
+    // coloured process, which is why here they append straight to the line.
+    function outRaw(s) { T.out += s; }
+    function outScontext(pid) {
+      outStr("`");
+      // libapparmor hands back the same text this file holds, so read the
+      // file the way out_scontext() falls back to doing.  Pid 0 has no
+      // directory of its own, and comes out with nothing in between.
+      var text = V.readFile("/proc/" + pid + "/attr/current");
+      if (text !== null && text !== undefined) outStr(String(text).replace(/\n$/, ""));
+      outStr("'");
+    }
+    // Returns how the caller's -N argument should bucket pid `n`: the
+    // kernel hands every process in this CT its namespaces from the
+    // initial set, so every process shares one inode per type -- until a
+    // non-root caller asks about a process it does not own.  Like the
+    // real /proc/<pid>/ns of a foreign process, stat(2) then fails with
+    // EPERM, which psmisc stores as a 0 and which consequently never
+    // matches anything real.
+    var NS_INODES = { cgroup: 4026531835, ipc: 4026531842, mnt: 4026531841,
+                      net: 4026531840, pid: 4026531836, time: 4026531843,
+                      user: 4026531838, uts: 4026531839 };
+    function nsVal(n) {
+      if (n.pid === 0) return 0;                 // the "?" node, never owned
+      var o = NS_INODES[T.nsid];
+      if (!o) return 0;
+      var v = sh.isRoot ? 0 : ((sh.env && sh.env.UID) ? parseInt(sh.env.UID, 10) : 1000);
+      if (v === 0 || n.uid === v) return o;
+      return 0;
+    }
+    // A node belongs under the namespace umbrella when it has no parent, or
+    // when its parent answers for a different namespace.  Everyone else
+    // stays put and belongs in no umbrella at all.
+    function detachTo(root, groups) {
+      if (!root) return;
+      if (root.parent === null || root.parent.nsVal !== root.nsVal) {
+        var g = null, i;
+        for (i = 0; i < groups.length; i++)
+          if (groups[i].number === root.nsVal) { g = groups[i]; break; }
+        if (!g) { g = { number: root.nsVal, roots: [] }; groups.push(g); }
+        g.roots.push(root);
+        if (root.parent) {
+          var pl = root.parent.children;
+          for (i = 0; i < pl.length; i++)
+            if (pl[i] === root) { pl.splice(i, 1); break; }
+          root.parent = null;
+        }
+      }
+      root.children.slice().forEach(function (c) { detachTo(c, groups); });
+    }
+    function dumpTree(cur, level, rep, leaf, last, prevUid, closing) {
+      if (!cur) return;
+      var sym = T.sym, lvl, i, add, offset, swapped, info, count, commLen,
+          first, idx, scan, nextIdx, child, hasNext, word, len, wb, who, q;
+      if (!leaf) {
+        for (lvl = 0; lvl < level; lvl++) {
+          for (i = T.widths[lvl] + 1; i; i--) outChar(" ", 1);
+          outStr(lvl === level - 1
+                 ? (last ? sym.last : sym.branch)
+                 : (T.mores[lvl + 1] ? sym.vert : sym.empty));
+        }
+      }
+      if (rep < 2) add = 0;
+      else { add = outInt(rep) + 2; outStr("*["); }
+      printColor(cur.age);
+      if (cur.flags & 1) outRaw(T.md);
+      swapped = info = T.printArgs ? 1 : 0;
+      if (swapped && cur.argc < 0) outChar("(", 1);
+      commLen = outArgs(cur.comm);
+      offset = T.curX;
+      if (T.pids) { outChar(info++ ? "," : "(", 1); outInt(cur.pid); }
+      if (T.pgids) { outChar(info++ ? "," : "(", 1); outInt(cur.pgid); }
+      if (T.userChange && prevUid !== cur.uid) {
+        outChar(info++ ? "," : "(", 1);
+        who = userForUid(cur.uid);
+        if (who) outStr(who); else outInt(cur.uid);
+      }
+      if (T.showScontext) { outChar(info++ ? "," : "(", 1); outScontext(cur.pid); }
+      if ((swapped && T.printArgs && cur.argc < 0) || (!swapped && info))
+        outChar(")", 1);
+      if (cur.flags & 1) outRaw(T.me);
+      if (T.printArgs) {
+        for (i = 0; i < cur.argc; i++) {
+          if (i < cur.argc - 1) outChar(" ", 1);   // spaces between words
+          word = cur.argv[i] === undefined ? "" : cur.argv[i];
+          wb = utf8(word);
+          len = 0;
+          for (q = 0; q < wb.length; q++)
+            len += (wb[q] >= 0x20 && wb[q] <= 0x7e) ? 1 : 4;
+          if (T.curX + len <= T.cols - (i === cur.argc - 1 ? 0 : 4) || !T.trunc)
+            outArgs(word);
+          else { outStr("..."); break; }
+        }
+      }
+      resetColor();
+      if (T.showScontext || T.printArgs || !cur.children.length) {
+        while (closing-- > 0) outChar("]", 1);
+        outNewline();
+      }
+      T.mores[level] = !last;
+
+      if (T.showScontext || T.printArgs) {
+        // With arguments on show every node owns its line, and each child
+        // writes the spaces and the vertical rule it needs before its name.
+        T.widths[level] = swapped + (commLen > 1 ? 0 : -1);
+        idx = 0;
+        while (idx < cur.children.length) {
+          child = cur.children[idx];
+          nextIdx = idx + 1;
+          count = 0;
+          if (T.compact && (child.flags & 2)) {
+            scan = idx + 1;
+            while (scan < cur.children.length) {
+              if (!treeEqual(child, cur.children[scan])) { scan++; continue; }
+              if (nextIdx === scan) nextIdx = scan + 1;
+              count++;
+              cur.children.splice(scan, 1);
+            }
+            hasNext = nextIdx < cur.children.length;
+            dumpTree(child, level + 1, count + 1, 0, !hasNext, cur.uid,
+                     closing + (count ? 1 : 0));
+          } else {
+            hasNext = idx + 1 < cur.children.length;
+            dumpTree(child, level + 1, 1, 0, !hasNext, cur.uid, 0);
+          }
+          idx = nextIdx;
+        }
+        return;
+      }
+      // Without arguments the name is only the start of the line: the first
+      // child's branch goes right after it and the newline arrives at the
+      // end of that child's subtree.
+      T.widths[level] = commLen + T.curX - offset + add;
+      if (T.curX >= T.cols && T.trunc) {
+        outStr(sym.first); outStr("+"); outNewline();
+        return;
+      }
+      first = 1;
+      idx = 0;
+      while (idx < cur.children.length) {
+        child = cur.children[idx];
+        nextIdx = idx + 1;
+        count = 0;
+        if (T.compact) {
+          scan = idx + 1;
+          while (scan < cur.children.length) {
+            if (!treeEqual(child, cur.children[scan])) { scan++; continue; }
+            if (nextIdx === scan) nextIdx = scan + 1;
+            count++;
+            cur.children.splice(scan, 1);
+          }
+        }
+        hasNext = nextIdx < cur.children.length;
+        if (first) { outStr(hasNext ? sym.first : sym.single); first = 0; }
+        // psmisc's source passes `closing + (count ? 2 : 1)` on the -a path
+        // and `count ? 1 : 0` on the plain one, but the 23.7 binary adds
+        // exactly one bracket for a collapsed run and none for a lone
+        // process on both, which is what pstree -a on a real machine shows.
+        // Follow the binary.
+        dumpTree(child, level + 1, count + 1, idx === 0, !hasNext, cur.uid,
+                 closing + (count ? 1 : 0));
+        idx = nextIdx;
+      }
+    }
+    function dumpByUser(cur, uid) {
+      if (!cur) return;
+      if (cur.uid === uid) {
+        if (T.dumped) T.out += "\n";       // putchar, so it costs no column
+        dumpTree(cur, 0, 1, 1, 1, uid, 0);
+        T.dumped = 1;
+        return;
+      }
+      cur.children.forEach(function (c) { dumpByUser(c, uid); });
+    }
+    // -s with a pid: show that process and the line of ancestors above it by
+    // throwing its siblings away at every level up to the root.
+    function trimByParent(self) {
+      if (!self) return;
+      var parent = self.parent;
+      if (!parent) return;
+      parent.children = [];
+      addChild(parent, self);
+      trimByParent(parent);
+    }
+
+    // ---- names ------------------------------------------------------------
+    function passwdRows() {
+      var text = V.readFile("/etc/passwd") || "";
+      return String(text).split("\n").map(function (line) {
+        var f = line.split(":");
+        return f.length >= 3 ? { name: f[0], uid: +f[2] } : null;
+      }).filter(function (r) { return !!r; });
+    }
+    function userForUid(uid) {
+      var rows = passwdRows();
+      for (var i = 0; i < rows.length; i++) if (rows[i].uid === uid) return rows[i].name;
+      return null;
+    }
+
+    // tgetent() against the one terminal this console is: TERM=linux, whose
+    // enter-bold is ESC[1m and whose leave-bold is ESC[m followed by
+    // shift-in, which is exactly what `pstree -h` prints on a real box with
+    // this TERM.  Nothing else here speaks termcap.
+    function caps() { T.md = "\u001b[1m"; T.me = "\u001b[m\u000f"; }
+    function termcap() { return !!(T.env.TERM && T.env.TERM.length); }
+    function myPid() { return (sh && sh._cmdPid) || (sh && sh.pid) || 1; }
+
+    // ---- options ----------------------------------------------------------
+    // getopt_long() as psmisc calls it: GNU's complaints, and GNU's
+    // permutation of the words, so `pstree 1 -p` is `pstree -p 1`.
+    function complaint(msg) {
+      T.err += "pstree: " + msg + "\n";
+      usage();
+    }
+    function apply(c, arg) {
+      switch (c) {
+        case "a": T.printArgs = 1; break;
+        case "A": T.sym = PSTREE_SYM.ascii; break;
+        case "c": T.compact = 0; break;
+        case "C":
+          if (String(arg) === "age") T.colorAge = 1;
+          else usage();
+          break;
+        case "G": T.sym = PSTREE_SYM.vt100; break;
+        case "h":
+          if (T.highlight) usage();
+          // tgetent() runs only here and in -H; without it tgetstr() has
+          // nothing to hand back and the highlight prints no escape at all.
+          if (termcap()) { caps(); T.highlight = myPid(); }
+          break;
+        case "H":
+          if (T.highlight) usage();
+          if (!T.env.TERM) { T.err += "TERM is not set\n"; bail(1); }
+          if (!termcap()) { T.err += "Can't get terminal capabilities\n"; bail(1); }
+          if (!parseInt(arg, 10)) usage();
+          caps();
+          T.highlight = parseInt(arg, 10);
+          break;
+        case "l": T.trunc = 0; break;
+        case "n": T.byPid = 1; break;
+        case "N":
+          if (!PSTREE_NS.hasOwnProperty(String(arg))) usage();
+          T.nsid = String(arg);
+          break;
+        case "p": T.pids = 1; T.compact = 0; break;
+        case "g": T.pgids = 1; break;
+        case "s": T.showParents = 1; break;
+        case "S": T.nsChange = 1; break;
+        case "t": T.threadNames = 1; break;
+        case "T": T.hideThreads = 1; break;
+        case "u": T.userChange = 1; break;
+        case "U": T.sym = PSTREE_SYM.utf; break;
+        case "V":
+          T.err += LW.PSVER.pstree.join("\n") + "\n";
+          bail(0);
+          break;
+        case "Z": T.showScontext = 1; break;
+        default: usage();
+      }
+    }
+    function parseOptions() {
+      var operands = [], i = 0;
+      while (i < args.length) {
+        var w = args[i];
+        if (w === "--") { i++; while (i < args.length) operands.push(args[i++]); break; }
+        if (w.length > 1 && w.charAt(0) === "-") {
+          if (w.charAt(1) === "-") {
+            var body = w.slice(2), eq = body.indexOf("="),
+                name = eq >= 0 ? body.slice(0, eq) : body,
+                inline = eq >= 0 ? body.slice(eq + 1) : null,
+                ch = PSTREE_LONG.hasOwnProperty(name) ? PSTREE_LONG[name] : null;
+            if (ch === null) complaint("unrecognized option '--" + name + "'");
+            var arg = null;
+            if (PSTREE_OPT.takes[ch]) {
+              if (inline !== null) arg = inline;
+              else if (i + 1 < args.length) arg = args[++i];
+              else complaint("option '--" + name + "' requires an argument");
+            } else if (inline !== null) {
+              complaint("option '--" + name + "' doesn't allow an argument");
+            }
+            apply(ch, arg);
+            i++;
+          } else {
+            var j = 1;
+            while (j < w.length) {
+              var c = w.charAt(j), a = null;
+              if (!PSTREE_OPT.valid[c]) complaint("invalid option -- '" + c + "'");
+              if (PSTREE_OPT.takes[c]) {
+                if (j + 1 < w.length) { a = w.slice(j + 1); j = w.length; }
+                else if (i + 1 < args.length) { a = args[++i]; j = w.length; }
+                else complaint("option requires an argument -- '" + c + "'");
+              } else j++;
+              apply(c, a);
+            }
+            i++;
+          }
+        } else { operands.push(w); i++; }
+      }
+      return operands;
+    }
+
+    // ---- main -------------------------------------------------------------
+    var code = 0;
+    try {
+      // get_output_width(): COLUMNS, then the terminal, then 132 -- what
+      // psmisc falls back to when stdout is a pipe.
+      var ce = T.env.COLUMNS;
+      if (ce && /^\d+$/.test(String(ce)) && +ce > 0 && +ce < 0x7fffffff) T.cols = +ce;
+      else T.cols = LW.TEXT_COLS || 80;
+      // find_root_pid(): pid 0 exists in a container, otherwise it is 1.
+      var rootPid = P.get(0) ? 0 : 1;
+      // psmisc picks its line-drawing set from the locale: UTF-8 symbols when
+      // stdout is a terminal speaking UTF-8, ASCII otherwise.  The shell's
+      // output is the terminal, and LANG here is C.UTF-8.
+      var cs = T.env.LC_ALL || T.env.LC_CTYPE || T.env.LANG || "";
+      T.sym = (cs && /UTF-?8/i.test(cs)) ? PSTREE_SYM.utf : PSTREE_SYM.ascii;
+
+      var operands = parseOptions();
+      var pid = rootPid, pidSet = false, pw = null;
+      if (operands.length === 1) {
+        var op = operands[0];
+        if (/^\d/.test(op)) {
+          var m = /^\d+/.exec(op);
+          pid = +m[0];
+          pidSet = true;
+          if (op.length !== m[0].length) usage();   // strtol left endptr behind
+        } else {
+          pw = passwdRows().filter(function (r) { return r.name === op; })[0];
+          if (!pw) { T.err += "No such user name: " + op + "\n"; bail(1); }
+        }
+      }
+      if (operands.length > 1) usage();
+
+      readProc(rootPid);
+      for (var cur = findProc(T.highlight); cur; cur = cur.parent) cur.flags |= 1;
+
+      if (T.showParents && pidSet) {
+        var picked = findProc(pid);
+        if (!picked) { T.err += "Process " + pid + " not found.\n"; bail(1); }
+        trimByParent(picked);
+        pid = rootPid;
+      }
+
+      if (T.nsid) {
+        T.nodes.forEach(function (n) { n.nsVal = nsVal(n); });
+        var groups = [];
+        detachTo(findProc(1), groups);
+        groups.forEach(function (g) {
+          outStr("[" + g.number + "]"); T.out += "\n"; T.curX = 1;
+          g.roots.forEach(function (r) { dumpTree(r, 0, 1, 1, 1, 0, 0); });
+        });
+      } else if (!pw) dumpTree(findProc(pid), 0, 1, 1, 1, 0, 0);
+      else {
+        dumpByUser(findProc(rootPid), pw.uid);
+        if (!T.dumped) { T.err += "No processes found.\n"; bail(1); }
+      }
+    } catch (x) {
+      if (!x || !x.pstreeExit) throw x;
+      code = x.code | 0;
+    }
+    if (T.err && sh && sh._error) sh._error(T.err.replace(/\n$/, ""));
+    return { out: T.out, code: code };
+  }
+
+  def("pstree", runPstree, "display a tree of processes");
+})(window.LW);

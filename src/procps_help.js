@@ -8,7 +8,9 @@
 //   LW.PSHELP.ps["all"]     -> the lines of `ps --help all`
 //   LW.PSHELP.psSpec        -> the lines of `ps L`
 //   LW.PSHELP.pgrep         -> the lines of `pgrep --help`
+//   LW.PSHELP.pstreeUsage   -> the usage text of pstree(1)
 //   LW.PSVER.ps             -> the lines of `ps --version`
+//   LW.PSVER.pstree         -> the lines of `pstree -V`
 //
 // src/procps.js reads these; nothing else should.
 (function (LW) {
@@ -525,7 +527,6 @@
       "",
     ],
     pstreeUsage: [
-      "pstree: unrecognized option '--bogus'",
       "Usage: pstree [-acglpsStTuZ] [ -h | -H PID ] [ -n | -N type ]",
       "              [ -A | -G | -U ] [ PID | USER ]",
       "   or: pstree -V",
@@ -575,6 +576,13 @@
       "pkill from procps-ng 4.0.5",
     ],
     pstree: [
+      "pstree (PSmisc) 23.7",
+      "Copyright (C) 1993-2024 Werner Almesberger and Craig Small",
+      "",
+      "PSmisc comes with ABSOLUTELY NO WARRANTY.",
+      "This is free software, and you are welcome to redistribute it under",
+      "the terms of the GNU General Public License.",
+      "For more information about these matters, see the files named COPYING.",
     ],
   };
 })(window.LW = window.LW || {});

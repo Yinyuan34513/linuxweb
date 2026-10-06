@@ -87,14 +87,21 @@
   // process; only the pid is ours to invent.  pids only ever go up, the way
   // they do on a machine that has been up for a while.
   function spawn(o) {
+    // The name a process is known by passes through a 16-byte buffer in the
+    // kernel (TASK_COMM_LEN), so /proc/pid/stat holds at most 15 characters
+    // of it: on a real machine `ps -o comm` says "systemd-journal", and
+    // `pgrep -x systemd-journald` finds nothing.  argv and the exe path keep
+    // the whole name, which is why `pstree -a` still prints it in full.
+    var comm = o.comm || "?";
+    if (comm.length > 15) comm = comm.slice(0, 15);
     var e = {
       pid: o.pid || nextPid++,
       ppid: o.ppid === undefined ? 1 : o.ppid,
       user: o.user || "root",
       uid: o.uid === undefined ? (o.user === "linuxweb" ? 1000 : 0) : o.uid,
       tty: o.tty || "?",
-      comm: o.comm || "?",
-      args: o.args === undefined ? o.comm : o.args,
+      comm: comm,
+      args: o.args === undefined ? (o.comm || "?") : o.args,
       stat: o.stat || "S",
       fg: !!o.fg,
       since: o.since === undefined ? 0 : o.since,
@@ -629,6 +636,8 @@
       cwd: { t: "l", dyn: true, ro: true, to: e.cwd || "/" },
       exe: { t: "l", dyn: true, ro: true, to: e.exe || "/usr/bin/" + e.comm },
       root: { t: "l", dyn: true, ro: true, to: "/" },
+      attr: { t: "d", dyn: true, ro: true,
+              c: { current: f(function () { return scontext(e) + "\n"; }) } },
       fd: { t: "d", dyn: true, ro: true, c: fdChildren(e) },
     };
     return { t: "d", dyn: true, ro: true, c: c, __entry: e };
@@ -663,6 +672,12 @@
       ? "0::/user.slice/user-1000.slice/session-1.scope"
       : "0::/system.slice";
   }
+
+  // /proc/pid/attr/current: the process's security context.  Nothing on
+  // this machine is confined, which is what libapparmor reports for every
+  // task and the one string both `ps -Z` and `pstree -Z` print -- the two
+  // read the same string here, so they cannot say different things.
+  function scontext(e) { return "unconfined"; }
 
   // /proc/pid/stat: the space-separated one, 52 fields, comm in brackets
   // because comm is the only field that can contain a space or a paren.
@@ -775,6 +790,7 @@
   LW.proc = {
     // table
     ensure: ensure, list: list, get: get, spawn: spawn, childrenOf: childrenOf,
+    uptime: uptime,
     reap: reap, exit: exitProcess, kill: kill, killByName: killByName,
     shellPid: function () { return shellPid; },
     setShellPid: function (p) { shellPid = p; },
@@ -792,6 +808,7 @@
     isLeader: isLeader, pgid: pgid, sid: sid, tpgid: tpgid, ttyNr: ttyNr,
     gid: gid, groupName: groupName, groupList: groupList,
     faults: faults, caps: caps, fdCount: fdCount, cgroupText: cgroupText,
+    scontext: scontext,
     SIGMASKS: SIGMASKS,
     // signals
     SIGNALS: SIGNALS, signalNumber: signalNumber, signalName: signalName,

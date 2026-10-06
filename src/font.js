@@ -19,4 +19,28 @@
     var c = code & 0xff;
     return DATA.subarray(c * 16, c * 16 + 16);
   };
+
+  // The light box-drawing characters, which live in the font at the CP437
+  // codes.  A text console has 256 glyphs and nothing else to draw them
+  // with, so when a UTF-8 program writes them -- `pstree -U` draws its tree
+  // with them -- the screen looks up the code it already has a glyph for,
+  // which is also what the Linux VT does.  Anything not listed keeps the
+  // old behaviour: the low byte of the code.
+  var BOX = {
+    0x2500: 0xc4,   // ─ light horizontal
+    0x2502: 0xb3,   // │ light vertical
+    0x250c: 0xda,   // ┌
+    0x2510: 0xbf,   // ┐
+    0x2514: 0xc0,   // └
+    0x2518: 0xd9,   // ┘
+    0x251c: 0xc3,   // ├
+    0x2524: 0xb4,   // ┤
+    0x252c: 0xc2,   // ┬
+    0x2534: 0xc1,   // ┴
+    0x253c: 0xc5,   // ┼
+  };
+
+  LW.cp437 = function (code) {
+    return BOX[code] === undefined ? code : BOX[code];
+  };
 })(window.LW);

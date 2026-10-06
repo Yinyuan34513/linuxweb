@@ -351,6 +351,21 @@ const GROUPS = {
     ["pidof -h", [], "pidof -h"],
     ["pidof no match", [], "pidof nomatchthing"],
     ["pidof no match, -s", [], "pidof -s nomatchthing"],
+    // ---- pstree --------------------------------------------------------------
+    ["pstree -V", [], "pstree -V"],
+    ["pstree --version", [], "pstree --version"],
+    ["pstree --help", [], "pstree --help"],
+    ["pstree invalid short", [], "pstree -Q"],
+    ["pstree unknown long", [], "pstree --bogus"],
+    ["pstree missing short arg", [], "pstree -H"],
+    ["pstree missing long arg", [], "pstree --color"],
+    ["pstree arg on no-arg long", [], "pstree --ascii=1"],
+    ["pstree bad -C value", [], "pstree -C bogus"],
+    ["pstree unknown namespace name", [], "pstree -N bogus"],
+    ["pstree two operands", [], "pstree 1 2"],
+    ["pstree unknown user", [], "pstree nosuchuser"],
+    ["pstree no such process", [], "pstree -s 99999"],
+    ["pstree -V with -a", [], "pstree -a -a -V"],
   ],
 };
 
