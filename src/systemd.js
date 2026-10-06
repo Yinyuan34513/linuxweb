@@ -322,13 +322,32 @@
       u.pid = 700 + (u.unit.length * 7 % 900);
       u.result = "success";
       u.startedAt = now();
+      // A service newly running has a new process to show in `ps` and /proc.
+      if (LW.proc && LW.proc.attachUnit) LW.proc.attachUnit(u);
     } else {
       delete u.pid;
+      if (LW.proc && LW.proc.detachUnit) LW.proc.detachUnit(u);
     }
     add({ unit: u.unit, ident: u.unit.split(".")[0], pid: u.pid || 0,
       message: on ? "Started " + u.desc + "." : "Stopped " + u.desc + "." });
     return { ok: true };
   }
+
+  // The service's main process just died underneath it: the unit's real state
+  // is "failed" (a clean stop puts result=exit-code only when the code is not 0,
+  // or signal when a signal took the process down).
+  function unitDied(unitName, sigNum) {
+    var u = byName[unitName];
+    if (!u || (u.kind !== "service" && u.kind !== "alias")) return;
+    delete u.pid;
+    u.active = "failed";
+    u.sub = "failed";
+    u.result = sigNum ? "signal" : "exit-code";
+    add({ unit: u.unit, ident: u.unit.split(".")[0], pid: 0,
+          message: unitStateVerb(u) + ": " + (sigNum ? "signal " + sigNum : "exit") });
+  }
+
+  function unitStateVerb(u) { return u.sub === "failed" ? "State change" : "Stop"; }
 
   // ---- the interface ------------------------------------------------------
 
@@ -351,6 +370,7 @@
     uptime: uptime,
     setActive: setActive,
     setEnabled: setEnabled,
+    unitDied: unitDied,
     wantsPath: wantsPath,
     syncWants: syncWants,
 
