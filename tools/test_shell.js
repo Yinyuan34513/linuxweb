@@ -12,7 +12,6 @@ vm.createContext(ctx);
 const dir = path.join(__dirname, "..");
 for (const f of ["src/bash.data.js", "src/help.js", "src/vfs.js", "src/bash.js",
                  "src/coreutils_help.js", "src/coreutils_text.js",
-                 "src/coreutils_file.js", "src/coreutils_sys.js",
                  "src/coreutils_digest.js"]) {
   vm.runInContext(fs.readFileSync(path.join(dir, f), "utf8"), ctx, { filename: f });
 }

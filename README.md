@@ -49,7 +49,6 @@ src/apt.js            apt/dpkg + the package catalogue
 src/bash.js           the shell: lexer, parser, executor, builtins, line editor
 src/coreutils_help.js GENERATED  verbatim `--help` / `--version` of coreutils 9.x
 src/coreutils_text.js coreutils text filters (wc, head, sort, tr, cut, ...)
-src/coreutils_file.js coreutils file commands (cp, mv, rm, chmod, stat, ...)
 src/coreutils_sys.js  coreutils system commands + dmesg/systemctl/journalctl
 src/systemd.js        the unit table and the journal they report from
 src/coreutils_digest.js coreutils checksums (md5sum, sha256sum, base64, ...)
@@ -75,6 +74,11 @@ tools/test_render.js       ANSI colour + attribute test suite
 tools/test_vt.js           VT escape-engine test suite
 tools/test_dev_apt.js      devtmpfs + apt test suite
 tools/test_magic.js        libmagic / `file` test suite
+tools/test_ps.js           ps / pstree header & format test suite
+tools/test_systemd.js      unit files, journal, systemctl test suite
+tools/test_proc.js         process table, /proc, ps agreement tests
+tools/test_pageload.js     script-order / page-boot guard
+tools/difftest.js          our coreutils vs the host's, exact-output difftest
 data/bootlog.txt      GENERATED  messages only, no timestamps
 data/userland.txt     hand-written init/systemd phase
 data/magic            optional curated database (the page ships the full one)
@@ -443,6 +447,11 @@ python3 tools/gen_bash_help.py     # -> src/help.js (help text, bind -P, set -o)
 node tools/test_shell.js           # shell suite
 node tools/test_getty.js           # sha256 / getty / IDBFS suite
 node tools/test_render.js          # ANSI colour suite
+node tools/test_systemd.js         # units, journal, systemctl
+node tools/test_proc.js            # process table / /proc / ps agreement
+node tools/test_ps.js              # ps (+pstree) format suite
+node tools/test_pageload.js        # page boot guard
+node tools/difftest.js             # everything vs the host's binaries
 ```
 
 `extract_font.py` self-tests the 4096-byte payload (length, base64 length, the

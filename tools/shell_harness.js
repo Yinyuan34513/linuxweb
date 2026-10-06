@@ -39,7 +39,6 @@ const DEFAULT_FILES = [
   "src/proc.js",
   "src/coreutils_help.js",
   "src/coreutils_text.js",
-  "src/coreutils_file.js",
   "src/coreutils_sys.js",
   "src/coreutils_digest.js",
   "src/procps_help.js",
